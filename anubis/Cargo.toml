@@ -1,0 +1,16 @@
+[package]
+name        = "anubis"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Anubis — Osiris system manager. The guardian and judge."
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "anubis"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }

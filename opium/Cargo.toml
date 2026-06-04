@@ -1,0 +1,16 @@
+[package]
+name        = "opium"
+version     = "0.2.0-alpha"
+edition     = "2021"
+description = "Official Package Manager In Use for Osiris — apt equivalent"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "opium"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }

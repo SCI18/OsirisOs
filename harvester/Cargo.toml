@@ -1,0 +1,16 @@
+[package]
+name        = "harvester"
+version     = "0.2.0-alpha"
+edition     = "2021"
+description = "Osiris package workhorse — dpkg equivalent and APK bridge"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "harvester"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }

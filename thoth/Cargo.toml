@@ -1,0 +1,16 @@
+[package]
+name        = "thoth"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Thoth — Osiris text editor. The scribe of the gods."
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "thoth"
+path = "src/main.rs"
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }

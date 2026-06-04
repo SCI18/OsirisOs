@@ -1,0 +1,15 @@
+[package]
+name        = "kha"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Osiris init system — PID 1, the life force"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "kha"
+path = "src/main.rs"
+
+[dependencies]
+# Kha stays minimal by design — no heavy dependencies
+# PID 1 must be lean and crash-resistant
+anyhow     = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name        = "ra-shell"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Ra shell — mobile and convergence mode layer. Knows phone vs desktop."
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "ra-shell"
+path = "src/main.rs"
+
+[dependencies]
+ra-config  = { path = "../ra-config" }
+ra-wm      = { path = "../ra-wm" }
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }

@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "kha",
+    "akernet/akernet-bridge",
+    "ra/ra-wm",
+    "ra/ra-panel",
+    "ra/ra-config",
+    "ra/ra-shell",
+    "opium",
+    "harvester",
+    "anubis",
+    "thoth",
+]
+
+# Shared dependencies across all workspace members
+[workspace.dependencies]
+tokio       = { version = "1",       features = ["full"] }
+serde       = { version = "1",       features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+axum        = "0.7"
+tracing             = "0.1"
+tracing-subscriber  = "0.3"
+anyhow      = "1"
+thiserror   = "1"
+clap        = { version = "4", features = ["derive"] }
+
+[workspace.metadata]
+project     = "Osiris OS"
+version     = "0.1.0-alpha"
+authors     = ["droidmaster"]
+description = "A modular, freedom-first operating system ecosystem"

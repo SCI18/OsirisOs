@@ -1,0 +1,1 @@
+// ra-config stub
