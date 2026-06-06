@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "maat",
     "kha",
     "akernet/akernet-bridge",
     "ra/ra-wm",

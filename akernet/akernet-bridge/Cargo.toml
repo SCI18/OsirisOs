@@ -10,7 +10,8 @@ name = "akernet-bridge"
 path = "src/main.rs"
 
 [dependencies]
-tokio              = { workspace = true }
+maat               = { path = "../../maat" }
+tokio              = { workspace = true, features = ["full", "process"] }
 axum               = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
