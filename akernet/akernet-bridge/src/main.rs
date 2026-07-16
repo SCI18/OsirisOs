@@ -195,6 +195,15 @@ async fn handle_daemon_connection(
                 tracing::info!("[bridge] Shutdown: {} — {}", name, reason);
                 state.lock().unwrap().mark_failed(&name);
             }
+            Ok(DaemonMessage::Alert { name, severity, payload, timestamp }) => {
+                tracing::warn!(
+                    "[bridge] ALERT [{}] from {} at {}: {}",
+                    severity.as_str(),
+                    name,
+                    timestamp,
+                    payload
+                );
+            }
             Err(e) => {
                 tracing::warn!("[bridge] Could not decode message: {}", e);
             }

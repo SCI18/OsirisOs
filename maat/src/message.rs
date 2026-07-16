@@ -5,6 +5,25 @@
 use serde::{Deserialize, Serialize};
 use crate::daemon::DaemonStatus;
 
+/// Severity level for daemon alerts
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl AlertSeverity {
+    pub fn as_str(&self) -> &str {
+        match self {
+            AlertSeverity::Info => "info",
+            AlertSeverity::Warning => "warning",
+            AlertSeverity::Critical => "critical",
+        }
+    }
+}
+
 /// Messages a daemon sends TO the Bridge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -29,6 +48,13 @@ pub enum DaemonMessage {
     Shutdown {
         name:   String,
         reason: String,
+    },
+    /// Daemon emits an alert (threshold breach, anomaly, etc.)
+    Alert {
+        name:      String,
+        severity:  AlertSeverity,
+        payload:   serde_json::Value,
+        timestamp: String,
     },
 }
 
