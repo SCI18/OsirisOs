@@ -6,6 +6,6 @@ pub mod registry;
 pub mod error;
 
 pub use daemon::{DaemonInfo, DaemonStatus, DaemonDomain};
-pub use message::{DaemonMessage, BridgeMessage};
+pub use message::{DaemonMessage, BridgeMessage, Frame, AlertSeverity};
 pub use registry::DaemonRegistry;
 pub use error::MaatError;
