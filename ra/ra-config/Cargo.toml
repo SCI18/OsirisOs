@@ -1,0 +1,15 @@
+[package]
+name        = "ra-config"
+version     = "0.8.0-alpha"
+edition     = "2021"
+description = "Ra config — shared TOML configuration for all Ra crates"
+authors     = ["droidmaster"]
+
+[lib]
+name = "ra_config"
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+toml       = { workspace = true }
+anyhow     = { workspace = true }

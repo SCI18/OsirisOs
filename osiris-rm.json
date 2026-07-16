@@ -1,0 +1,618 @@
+{
+  "project": "Osiris OS",
+  "description": "A modular, freedom-first operating system ecosystem built ground-up in Rust, inspired by Egyptian mythology. Targets mobile, laptop, and desktop with a unified codebase and two release philosophies.",
+  "philosophy": "Everything ground up. Every name earns its place. Every component knows its job. Nothing overlaps.",
+  "releases": {
+    "mobile": [
+      {
+        "name": "Osiris Ramesses",
+        "type": "Daily Driver",
+        "audience": "General users — people tired of Google/Apple but not willing to tinker",
+        "philosophy": "Stable, prosperous, just works. Sane defaults. Services managed silently.",
+        "daemon_mode": "managed"
+      },
+      {
+        "name": "Osiris Netjeru",
+        "type": "Power User",
+        "audience": "Developers, indie builders, privacy researchers",
+        "philosophy": "Exposed, divine, no guardrails. Every daemon visible and replaceable.",
+        "daemon_mode": "exposed"
+      }
+    ],
+    "desktop": {
+      "name": "Osiris OS",
+      "type": "x86/x64 Workstation & Laptop",
+      "base": "Debian Trixie (scaffold, replaced progressively)",
+      "note": "Built first. Mobile follows after PC stack is stable."
+    }
+  },
+  "hardware_roadmap": {
+    "phase_1a": {
+      "name": "Pinephone Pro",
+      "soc": "Rockchip RK3399S",
+      "reason": "Best open mobile Linux target. Mainline kernel, open bootloader, hardware kill switches, community aligned with Osiris."
+    },
+    "phase_1b": {
+      "name": "Framework Laptop",
+      "reason": "Shared modularity philosophy. Excellent mainline Linux support. Target audience overlap with Netjeru users. Ra desktop battle-tested here before mobile."
+    },
+    "phase_2": {
+      "name": "Sokar",
+      "type": "Osiris Reference Device",
+      "description": "Ground-up hardware designed for Osiris. Modular components mirroring OPIUM package philosophy. Hardware kill switches mapped per daemon. Open bootloader by design.",
+      "mythology": "Sokar — Egyptian god of the physical vessel, craftsman of sacred objects. Later merged with Osiris into Ptah-Sokar-Osiris."
+    }
+  },
+  "init_system": {
+    "name": "Kha",
+    "type": "PID 1 — Lightweight Rust init",
+    "description": "Minimal Rust binary. Mounts essential filesystems, reaps zombies, forwards signals. Single responsibility: stay alive and hand control to AkerNet Bridge.",
+    "size_target": "~300 lines",
+    "mythology": "Kha — Egyptian concept of the life-force/spirit double.",
+    "spawns": "AkerNet Bridge"
+  },
+  "the_abyss_network": {
+    "description": "42 daemons across 9 domains. The foundation everything runs on. Unseen, modular, everything depends on it.",
+    "mythology": "The Abyss (Nun) — primordial void everything emerged from. The 42 Assessors of Ma'at — divine judges at the weighing of the soul. The OS declares itself to 42 daemons before it lives.",
+    "total_daemons": 42,
+    "domains": {
+      "system_core": {
+        "id": 1,
+        "daemon_count": 6,
+        "daemons": [
+          {
+            "id": 1,
+            "name": "kha-watchd",
+            "responsibility": "Monitors Kha itself, system heartbeat"
+          },
+          {
+            "id": 2,
+            "name": "logd",
+            "responsibility": "Unified system logging, ring buffer"
+          },
+          {
+            "id": 3,
+            "name": "healthd",
+            "responsibility": "CPU/RAM/thermal monitoring"
+          },
+          {
+            "id": 4,
+            "name": "timed",
+            "responsibility": "System time, NTP sync"
+          },
+          {
+            "id": 5,
+            "name": "entropyd",
+            "responsibility": "Entropy pool management, RNG seeding"
+          },
+          {
+            "id": 6,
+            "name": "mountd",
+            "responsibility": "Filesystem mount management post-boot"
+          }
+        ]
+      },
+      "hardware": {
+        "id": 2,
+        "daemon_count": 8,
+        "daemons": [
+          {
+            "id": 7,
+            "name": "batteryd",
+            "responsibility": "Charge state, health, thermal limits"
+          },
+          {
+            "id": 8,
+            "name": "modemd",
+            "responsibility": "Telephony, SIM, carrier management"
+          },
+          {
+            "id": 9,
+            "name": "camerad",
+            "responsibility": "Camera pipeline, sensor management"
+          },
+          {
+            "id": 10,
+            "name": "sensorsd",
+            "responsibility": "Gyro, accelerometer, proximity, light"
+          },
+          {
+            "id": 11,
+            "name": "vibrd",
+            "responsibility": "Haptic feedback"
+          },
+          {
+            "id": 12,
+            "name": "gpiod",
+            "responsibility": "Hardware kill switch states, GPIO events"
+          },
+          {
+            "id": 13,
+            "name": "thermald",
+            "responsibility": "Thermal zones, throttling policy"
+          },
+          {
+            "id": 14,
+            "name": "fwatchd",
+            "responsibility": "Firmware/hardware fault monitoring"
+          }
+        ]
+      },
+      "input": {
+        "id": 3,
+        "daemon_count": 4,
+        "daemons": [
+          {
+            "id": 15,
+            "name": "inputd",
+            "responsibility": "Unified input via libinput. Keyboard, mouse, touch, stylus."
+          },
+          {
+            "id": 16,
+            "name": "btd",
+            "responsibility": "Bluetooth stack, HID pairing, reconnection"
+          },
+          {
+            "id": 17,
+            "name": "usbd",
+            "responsibility": "USB OTG, hotplug, gadget mode switching"
+          },
+          {
+            "id": 18,
+            "name": "displayd",
+            "responsibility": "Output management, external display routing, convergence trigger"
+          }
+        ]
+      },
+      "display_graphics": {
+        "id": 4,
+        "daemon_count": 3,
+        "daemons": [
+          {
+            "id": 19,
+            "name": "compositord",
+            "responsibility": "Ra-mobile Wayland compositor"
+          },
+          {
+            "id": 20,
+            "name": "brightd",
+            "responsibility": "Display brightness, adaptive light response"
+          },
+          {
+            "id": 21,
+            "name": "rotationd",
+            "responsibility": "Screen rotation, orientation lock"
+          }
+        ]
+      },
+      "network_akernet": {
+        "id": 5,
+        "daemon_count": 6,
+        "daemons": [
+          {
+            "id": 22,
+            "name": "netd",
+            "responsibility": "Core network management, interfaces"
+          },
+          {
+            "id": 23,
+            "name": "wifid",
+            "responsibility": "WiFi scanning, connection, profiles"
+          },
+          {
+            "id": 24,
+            "name": "dnsd",
+            "responsibility": "AdGuardHome integration, DNS filtering"
+          },
+          {
+            "id": 25,
+            "name": "vpnd",
+            "responsibility": "VPN lifecycle, kill switch"
+          },
+          {
+            "id": 26,
+            "name": "firewalld",
+            "responsibility": "Packet filtering, per-app rules"
+          },
+          {
+            "id": 27,
+            "name": "proxyd",
+            "responsibility": "Traffic routing, privacy proxy"
+          }
+        ]
+      },
+      "audio": {
+        "id": 6,
+        "daemon_count": 3,
+        "daemons": [
+          {
+            "id": 28,
+            "name": "audiod",
+            "responsibility": "PipeWire core, audio routing"
+          },
+          {
+            "id": 29,
+            "name": "voiced",
+            "responsibility": "Call audio, noise cancellation, mic routing"
+          },
+          {
+            "id": 30,
+            "name": "meliad",
+            "responsibility": "Media session management, playback controls"
+          }
+        ]
+      },
+      "user_session": {
+        "id": 7,
+        "daemon_count": 4,
+        "daemons": [
+          {
+            "id": 31,
+            "name": "sessiond",
+            "responsibility": "User session lifecycle, login state"
+          },
+          {
+            "id": 32,
+            "name": "appd",
+            "responsibility": "App launch, sandbox management"
+          },
+          {
+            "id": 33,
+            "name": "convergenced",
+            "responsibility": "DeX-style mode switching, layout management"
+          },
+          {
+            "id": 34,
+            "name": "clipboardd",
+            "responsibility": "Clipboard management across convergence modes"
+          }
+        ]
+      },
+      "security": {
+        "id": 8,
+        "daemon_count": 4,
+        "daemons": [
+          {
+            "id": 35,
+            "name": "cryptd",
+            "responsibility": "Disk encryption, key management"
+          },
+          {
+            "id": 36,
+            "name": "permd",
+            "responsibility": "App permission enforcement"
+          },
+          {
+            "id": 37,
+            "name": "auditd",
+            "responsibility": "Security event logging, anomaly detection"
+          },
+          {
+            "id": 38,
+            "name": "biod",
+            "responsibility": "Biometric authentication, fingerprint"
+          }
+        ]
+      },
+      "services": {
+        "id": 9,
+        "daemon_count": 4,
+        "daemons": [
+          {
+            "id": 39,
+            "name": "notifyd",
+            "responsibility": "Notification routing, priority management"
+          },
+          {
+            "id": 40,
+            "name": "syncd",
+            "responsibility": "Background sync, app data management"
+          },
+          {
+            "id": 41,
+            "name": "locationd",
+            "responsibility": "GPS, network location, privacy controls"
+          },
+          {
+            "id": 42,
+            "name": "updated",
+            "responsibility": "OPIUM update checks, delta patching"
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "akernet": {
+      "name": "AkerNet",
+      "type": "Network + Daemon Orchestration Layer",
+      "version": "0.1.2",
+      "stack": "Rust, Axum",
+      "description": "Command/control abstraction layer. Spawned by Kha. Orchestrates all 42 daemons via dependency graph. Owns the network domain entirely.",
+      "subcomponents": {
+        "akernet_bridge": "Rust/Axum HTTP bridge. Daemon lifecycle management.",
+        "aker_app": "Kotlin Android app. Unified control surface for all daemons. SDK 34."
+      },
+      "mythology": "Aker — Egyptian god of the earth and horizon, guardian of transitions."
+    },
+    "ra": {
+      "name": "Ra",
+      "type": "Wayland Compositor + Shell",
+      "current_version": "0.7.0",
+      "target": "Wayland rewrite (wlroots backend)",
+      "workspace_crates": [
+        "ra-wm",
+        "ra-panel",
+        "ra-config",
+        "ra-shell"
+      ],
+      "modes": {
+        "desktop": "Floating windows, panel, keyboard shortcuts. Default on Framework/desktop.",
+        "mobile": "Fullscreen app management, gesture navigation, status bar.",
+        "convergence": "Auto-switches on external display + peripheral detection via convergenced daemon."
+      },
+      "description": "The compositor and visual shell of Osiris. One codebase across phone, laptop, and desktop.",
+      "mythology": "Ra — Egyptian sun god. The light of Osiris."
+    },
+    "opium": {
+      "name": "OPIUM",
+      "type": "Package Manager (apt-equivalent)",
+      "description": "High-level package manager. Resolves dependencies, manages repos, handles upgrades. Calls Harvester underneath.",
+      "interfaces": {
+        "ramesses": "Osiris Store — graphical frontend",
+        "netjeru": "Full CLI access"
+      },
+      "package_format": ".osr",
+      "mythology": "OPIUM — package management as alchemy."
+    },
+    "harvester": {
+      "name": "Harvester",
+      "type": "Package Workhorse (dpkg-equivalent) + APK Bridge",
+      "description": "Low-level package handler. Installs raw .osr packages, maintains package database. No dependency resolution — that's OPIUM's job.",
+      "mobile_role": "APK extractor from existing Android installs + Waydroid bridge for running extracted apps inside Osiris.",
+      "pc_role": "dpkg-equivalent. Touches the filesystem directly. OPIUM calls it.",
+      "package_format": ".osr"
+    },
+    "package_format": {
+      "extension": ".osr",
+      "name": "Osiris Package",
+      "description": "Native Osiris package format. Every .osr carries the Osiris name. Managed by Harvester, orchestrated by OPIUM."
+    },
+    "anubis": {
+      "name": "Anubis",
+      "type": "System Manager",
+      "description": "System management UI. Manages processes, storage, users, system health. Built after the core stack is stable.",
+      "mythology": "Anubis — Egyptian god of the dead, guardian and judge of souls."
+    },
+    "thoth": {
+      "name": "Thoth",
+      "type": "Text Editor",
+      "description": "Native Osiris text editor. Built inside Osiris, for Osiris.",
+      "mythology": "Thoth — Egyptian god of writing, knowledge, and scribes."
+    },
+    "heka": {
+      "name": "Heka",
+      "type": "IDE",
+      "description": "Native Osiris IDE. Existing Tauri codebase. Built inside Osiris.",
+      "mythology": "Heka — Egyptian god of magic and medicine.",
+      "status": "Legacy IDE intended to become a built-in Osiris application; source/import path still needs to be recorded."
+    },
+    "repoSpace": {
+      "name": "RepoSpace",
+      "type": "In-house IDE + Version Control Hub",
+      "description": "Osiris-native IDE with integrated repo management. The inhouse GitHub of Osiris.",
+      "features": [
+        "Monaco editor",
+        "Simple repo search",
+        "Offline work capability",
+        "Repo management",
+        "Direct port to code editor",
+        "Custom terminal",
+        "Clean filesystem management",
+        "Extensions/plugins (planned)"
+      ],
+      "status": "Built previously according to project history; reconcile with Heka naming/product boundary before adding to workspace.",
+      "note": "Simple yet better than VS Code."
+    }
+  },
+  "build_environment": {
+    "primary": "Samsung Galaxy A07 — Termux + proot-distro (Debian Trixie)",
+    "bare_termux_role": "Supervisor layer. AkerNet bridge, Git operations, backup scripts.",
+    "proot_debian_role": "Construction site. Full build environment. Osiris system lives here.",
+    "phantom_process_killer": "Must be disabled in Developer Options before any build session.",
+    "wake_lock": "Termux wake lock must be acquired."
+  },
+  "backup_strategy": {
+    "layer_1": {
+      "name": "GitHub monorepo",
+      "description": "Granular versioned history. One repo, all components.",
+      "structure": [
+        "kha/",
+        "akernet/",
+        "ra/",
+        "opium/",
+        "harvester/",
+        "anubis/",
+        "thoth/",
+        "heka/",
+        "repoSpace/",
+        "docs/"
+      ]
+    },
+    "layer_2": {
+      "name": "Local proot snapshot",
+      "description": "tar snapshot of proot Debian after each stage.",
+      "tar_flags": "--no-same-owner --hard-dereference",
+      "naming": "osiris-pc-{stage}-{YYYYMMDD}.tar.gz"
+    },
+    "layer_3": {
+      "name": "Android storage",
+      "description": "Mirror of Layer 2 snapshots on /sdcard/osiris-backups. Survives Debian death entirely."
+    }
+  },
+  "build_roadmap": {
+    "note": "PC first. Mobile follows after PC stack is stable.",
+    "milestone_0": {
+      "name": "Hosted Osiris Core",
+      "purpose": "Establish a runnable Osiris core inside Termux/proot before claiming real OS boot or hardware support.",
+      "tasks": [
+        "cargo build --workspace succeeds from ~/projects/osiris",
+        "Kha runs as a normal hosted process and can supervise akernet-bridge",
+        "AkerNet bridge exposes root and /health endpoints from the reconciled Netjeru implementation",
+        "Harvester can harvest, install, remove, and list a simple .osr package in the hosted environment",
+        "OPIUM can call Harvester and maintain package metadata",
+        "Document host-provided vs Osiris-provided responsibilities for Termux/proot, Debian scaffold, and future hardware boot",
+        "Record import plan for external ra, netjeru, and Heka/RepoSpace projects"
+      ]
+    },
+    "stage_1": {
+      "name": "Foundation",
+      "tasks": [
+        "GitHub monorepo setup",
+        "Minimal Debian base confirmed in proot",
+        "Harvester bootstrap script",
+        "Rust toolchain via Harvester",
+        "AkerNet bridge ported into Osiris monorepo",
+        "Kha skeleton — PID 1 stub, boots to shell",
+        "Core Abyss daemons: logd, mountd, healthd, timed"
+      ]
+    },
+    "stage_2": {
+      "name": "Network + Package Layer",
+      "tasks": [
+        "AkerNet bridge fully integrated",
+        "netd, wifid, dnsd daemons",
+        "Harvester — .osr format, install/remove",
+        "OPIUM — basic CLI, repo management"
+      ]
+    },
+    "stage_3": {
+      "name": "Display + Session",
+      "tasks": [
+        "Ra — Wayland rewrite with wlroots",
+        "Ra roadmap completion: resize, focus highlight, wallpaper",
+        "sessiond, compositord, displayd",
+        "System boots to Ra desktop"
+      ]
+    },
+    "stage_4": {
+      "name": "Complete the Stack",
+      "tasks": [
+        "Remaining 42 Abyss daemons",
+        "Anubis — system manager",
+        "Thoth — text editor, built inside Osiris",
+        "Heka — IDE, built inside Osiris",
+        "RepoSpace — integrated, replacing external tools"
+      ]
+    },
+    "stage_5": {
+      "name": "Mobile Port",
+      "tasks": [
+        "Ra-mobile — ra-shell layer, touch input, gesture navigation",
+        "Convergence mode — auto-switch on peripheral detection",
+        "Pinephone Pro bring-up",
+        "Osiris Ramesses build",
+        "Osiris Netjeru build"
+      ]
+    },
+    "stage_6": {
+      "name": "Framework Laptop",
+      "tasks": [
+        "Osiris PC on Framework hardware",
+        "Ra desktop battle-tested on real laptop",
+        "OTG, Bluetooth HID, external display"
+      ]
+    }
+  },
+  "naming_mythology": {
+    "Osiris": "The god of resurrection and the afterlife. The OS itself.",
+    "Kha": "The life-force/spirit double. Init — keeps everything alive.",
+    "Ra": "The sun god. The compositor — the light of Osiris.",
+    "AkerNet": "Aker, guardian of transitions. The network and orchestration layer.",
+    "Thoth": "God of writing and knowledge. The text editor.",
+    "Heka": "God of magic. The IDE.",
+    "Anubis": "Guardian and judge of souls. The system manager.",
+    "OPIUM": "Package management as alchemy.",
+    "Harvester": "The reaper — takes what is needed, installs it cleanly.",
+    "The Abyss Network": "Nun, the primordial void. The 42 daemons — the 42 Assessors of Ma'at.",
+    "Ramesses": "Ramesses II — the most prosperous pharaoh. The daily driver release.",
+    "Netjeru": "The gods/divine beings. The power user release.",
+    "Sokar": "God of the physical vessel. The Osiris reference hardware.",
+    "RepoSpace": "The space where Osiris builds itself."
+  },
+  "current_status": {
+    "last_reviewed": "2026-06-03",
+    "summary": "Osiris is a Rust workspace with core crates scaffolded. Kha, OPIUM, and Harvester have meaningful hosted/proot-era code. AkerNet and Ra have older source projects in ~/projects that must be reconciled before roadmap status can be trusted. Heka/RepoSpace is planned as a built-in first-party application but is not currently present in this workspace.",
+    "workspace_state": {
+      "root": "~/projects/osiris",
+      "readme_present": false,
+      "cargo_workspace": true,
+      "members": [
+        "kha",
+        "akernet/akernet-bridge",
+        "ra/ra-wm",
+        "ra/ra-panel",
+        "ra/ra-config",
+        "ra/ra-shell",
+        "opium",
+        "harvester",
+        "anubis",
+        "thoth"
+      ],
+      "missing_or_external": [
+        "heka",
+        "repoSpace"
+      ]
+    },
+    "implementation_snapshot": {
+      "kha": "Implemented as a hosted/proot-friendly supervisor that mounts essentials when possible, spawns akernet-bridge, reaps child processes, and restarts the bridge. Not yet true boot PID 1 on hardware.",
+      "akernet": "Osiris monorepo copy is currently a Stage 2 stub. Original Netjeru akernet-bridge has an Axum HTTP server with root and /health routes on port 7474.",
+      "ra": "Osiris monorepo ra-wm is currently a placeholder for v0.8.0-alpha Wayland rebuild. External ~/projects/ra contains an older X11/x11rb window manager with resize, framing, config, and panel work.",
+      "opium": "CLI package manager exists with install/remove/purge/list/search/info/update/harvest commands and delegates harvesting to Harvester.",
+      "harvester": "CLI workhorse exists with harvest/install/remove/list/env commands and environment-aware config.",
+      "anubis": "Workspace member present; implementation status not reviewed in this pass.",
+      "thoth": "Stub text editor crate present.",
+      "heka_repoSpace": "Legacy IDE exists by project history and should become a built-in Osiris application; source location/import plan still needs to be recorded."
+    },
+    "external_source_projects": {
+      "ra": {
+        "path": "~/projects/ra",
+        "role": "Original Ra desktop environment source",
+        "workspace_members": [
+          "crates/ra-wm",
+          "crates/ra-panel"
+        ],
+        "status": "External source to reconcile with osiris/ra before Stage 3."
+      },
+      "netjeru": {
+        "path": "~/projects/netjeru",
+        "role": "Original AkerNet/Netjeru source",
+        "workspace_members": [
+          "akn",
+          "aker-server",
+          "akernet-bridge"
+        ],
+        "status": "External source to reconcile with osiris/akernet before Stage 2. Contains embedded AdGuardHome data that should not be blindly imported into the monorepo."
+      },
+      "heka_repoSpace": {
+        "path": "unknown",
+        "role": "Legacy IDE / repo hub intended as built-in Osiris app",
+        "status": "Find source, decide whether Heka and RepoSpace are one product lineage or separate apps, then import as a workspace member."
+      }
+    },
+    "immediate_risks": [
+      "No local README or status ledger, so project memory depends on roadmap accuracy.",
+      "Git status appears to come from a parent repository rather than an Osiris-local repo. Confirm repository boundaries before commits.",
+      "Several roadmap components exist both as stubs in Osiris and as older external projects; migration policy is needed to avoid losing working code."
+    ],
+    "last_verified_build": {
+      "date": "2026-06-03",
+      "command": "cargo check --workspace",
+      "result": "passed",
+      "notes": [
+        "Workspace checks successfully in dev profile.",
+        "opium currently emits unused/dead-code warnings in repo.rs and manifest.rs; no hard build failures."
+      ]
+    }
+  }
+}

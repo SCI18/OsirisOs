@@ -1,0 +1,16 @@
+[package]
+name        = "maat"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Ma'at — the law every Osiris daemon is measured against. Shared interface for The Abyss Network."
+authors     = ["droidmaster"]
+
+[lib]
+name = "maat"
+path = "src/lib.rs"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+toml        = { workspace = true }
+thiserror   = { workspace = true }
