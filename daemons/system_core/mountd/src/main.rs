@@ -1,14 +1,14 @@
-// mountd — Assessor #6, SystemCore
+ mountd — Assessor #6, SystemCore
 // Filesystem mount management post-boot
 // "Mounts are weighed. The unmounted are known."
 
 use std::collections::HashMap;
 use std::fs;
 use std::ffi::CString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
@@ -88,17 +88,14 @@ struct FstabEntry {
     options: Vec<String>,
     dump: u8,
     pass: u8,
-    /// Alert severity from x-osiris-alert option
     alert_severity: Option<AlertSeverity>,
-    /// Alert on missing mount
     alert_on_missing: bool,
-    /// Alert on fs type mismatch
     alert_on_fs_mismatch: bool,
-    /// Alert on mount options change
     alert_on_options_change: bool,
-    /// Disk usage warning threshold (percentage)
+    /// Explicitly expected to be read-only (e.g. a boot partition). Suppresses
+    /// the FilesystemReadOnly alert for this mount point since RO is intentional.
+    expected_readonly: bool,
     disk_warning_pct: Option<f32>,
-    /// Disk usage critical threshold (percentage)
     disk_critical_pct: Option<f32>,
 }
 
@@ -181,13 +178,16 @@ struct Mountd {
     known_mounts: Arc<Mutex<HashMap<String, MountEntry>>>,
     expected_mounts: Arc<Mutex<HashMap<String, FstabEntry>>>,
     known_propagation: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Tracks which mount points we've already alerted as read-only, so we
+    /// only alert on the *transition* into RO, not every poll cycle.
+    known_readonly: Arc<Mutex<HashMap<String, bool>>>,
     last_alerts: Arc<Mutex<HashMap<String, (AlertSeverity, u64)>>>,
 }
 
 impl Mountd {
     fn new(config: MountdConfig) -> Result<Self> {
         let expected = Self::parse_fstab(&config)?;
-        
+
         Ok(Self {
             socket: Arc::new(Mutex::new(None)),
             daemon_name: "mountd".to_string(),
@@ -196,6 +196,7 @@ impl Mountd {
             known_mounts: Arc::new(Mutex::new(HashMap::new())),
             expected_mounts: Arc::new(Mutex::new(expected)),
             known_propagation: Arc::new(Mutex::new(HashMap::new())),
+            known_readonly: Arc::new(Mutex::new(HashMap::new())),
             last_alerts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -204,35 +205,33 @@ impl Mountd {
     fn parse_fstab(config: &MountdConfig) -> Result<HashMap<String, FstabEntry>> {
         let mut expected = HashMap::new();
         let content = fs::read_to_string(&config.fstab_path).unwrap_or_default();
-        
+
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            
+
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 6 {
                 continue;
             }
-            
+
             let device = parts[0].to_string();
             let mount_point = parts[1].to_string();
             let fs_type = parts[2].to_string();
             let options_str = parts[3];
             let dump = parts[4].parse::<u8>().unwrap_or(0);
             let pass = parts[5].parse::<u8>().unwrap_or(0);
-            
-            // Skip special filesystems that aren't real mounts
-            if matches!(fs_type.as_str(), 
-                "proc" | "sysfs" | "devpts" | "tmpfs" | "devtmpfs" | 
-                "cgroup" | "cgroup2" | "pstore" | "bpf" | "autofs" | "mqueue" | 
-                "configfs" | "debugfs" | "tracefs" | "securityfs" | "selinuxfs" | 
+
+            if matches!(fs_type.as_str(),
+                "proc" | "sysfs" | "devpts" | "tmpfs" | "devtmpfs" |
+                "cgroup" | "cgroup2" | "pstore" | "bpf" | "autofs" | "mqueue" |
+                "configfs" | "debugfs" | "tracefs" | "securityfs" | "selinuxfs" |
                 "efivarfs" | "hugetlbfs" | "fuse.gvfsd-fuse" | "fusectl") {
                 continue;
             }
-            
-            // Parse options including x-osiris-alert
+
             let options: Vec<String> = options_str.split(',').map(|s| s.to_string()).collect();
             let mut alert_severity = None;
             let mut alert_on_missing = false;
@@ -240,7 +239,10 @@ impl Mountd {
             let mut alert_on_options_change = false;
             let mut disk_warning_pct = None;
             let mut disk_critical_pct = None;
-            
+
+            // NOTE: x-osiris-alert options previously conflated severity level
+            // and boolean triggers under one key (documented gap — flagged
+            // separately, not a bug fix in this pass). Kept as-is here.
             for opt in &options {
                 if opt.starts_with("x-osiris-alert=") {
                     let val = &opt["x-osiris-alert=".len()..];
@@ -261,7 +263,11 @@ impl Mountd {
                     disk_critical_pct = val.parse::<f32>().ok();
                 }
             }
-            
+
+            // A mount explicitly listed with "ro" in fstab options is expected
+            // to be read-only — don't alert on it being read-only.
+            let expected_readonly = options.iter().any(|o| o == "ro");
+
             let entry = FstabEntry {
                 device,
                 mount_point: mount_point.clone(),
@@ -273,13 +279,14 @@ impl Mountd {
                 alert_on_missing,
                 alert_on_fs_mismatch,
                 alert_on_options_change,
+                expected_readonly,
                 disk_warning_pct,
                 disk_critical_pct,
             };
-            
+
             expected.insert(mount_point, entry);
         }
-        
+
         info!("[mountd] Parsed {} expected mounts from fstab", expected.len());
         Ok(expected)
     }
@@ -288,29 +295,27 @@ impl Mountd {
     async fn parse_mountinfo(&self) -> Result<HashMap<String, MountEntry>> {
         let content = fs::read_to_string(&self.config.mountinfo_path)?;
         let mut mounts = HashMap::new();
-        
+
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 10 {
                 continue;
             }
-            
-            // Format: mount_id parent_id major:minor root mount_point mount_options optional_fields... - fs_type mount_source super_options
+
             let mount_id = parts[0].parse::<u32>().unwrap_or(0);
             let parent_id = parts[1].parse::<u32>().unwrap_or(0);
-            
+
             let dev_parts: Vec<&str> = parts[2].split(':').collect();
-            let major = dev_parts.get(0).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let major = dev_parts.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
             let minor = dev_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-            
+
             let root = parts[3].to_string();
             let mount_point = parts[4].to_string();
-            
-            // Find the separator "-" to get fs_type
+
             let mut fs_type = String::new();
             let mut mount_options = Vec::new();
             let mut optional_fields = Vec::new();
-            
+
             for (i, part) in parts.iter().enumerate().skip(5) {
                 if *part == "-" {
                     if i + 1 < parts.len() {
@@ -318,20 +323,18 @@ impl Mountd {
                     }
                     break;
                 }
-                // Before "-" are mount options and optional fields
                 if part.starts_with("shared:") || part.starts_with("master:") || part.starts_with("propagate:") || part.starts_with("unbindable") {
                     optional_fields.push(part.to_string());
                 } else {
                     mount_options = part.split(',').map(|s| s.to_string()).collect();
                 }
             }
-            
-            // Extract propagation flags from optional_fields
+
             let propagation_flags: Vec<String> = optional_fields.iter()
-                .filter(|s| s.starts_with("shared:") || s.starts_with("master:") || s.starts_with("propagate:") || s == &"unbindable")
+                .filter(|s| s.starts_with("shared:") || s.starts_with("master:") || s.starts_with("propagate:") || s.as_str() == "unbindable")
                 .cloned()
                 .collect();
-            
+
             let entry = MountEntry {
                 mount_id,
                 parent_id,
@@ -344,39 +347,42 @@ impl Mountd {
                 optional_fields,
                 propagation_flags,
             };
-            
+
             mounts.insert(mount_point, entry);
         }
-        
+
         Ok(mounts)
     }
 
-    /// Fallback mount parsing using `mount` command (for proot environments)
+    /// Fallback mount parsing using `mount` command (for proot environments).
+    /// Runs the subprocess on a blocking thread since Command::output() is
+    /// synchronous and would otherwise stall the tokio worker thread.
     async fn parse_mount_cmd(&self) -> Result<HashMap<String, MountEntry>> {
-        let output = Command::new(&self.config.mount_cmd)
-            .output()
-            .context("Failed to run mount command")?;
-        
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("mount command failed"));
-        }
-        
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mount_cmd = self.config.mount_cmd.clone();
+
+        let stdout = tokio::task::spawn_blocking(move || -> Result<String> {
+            let output = Command::new(&mount_cmd)
+                .output()
+                .context("Failed to run mount command")?;
+            if !output.status.success() {
+                return Err(anyhow::anyhow!("mount command failed"));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        }).await.context("mount command task panicked")??;
+
         let mut mounts = HashMap::new();
-        
+
         for line in stdout.lines() {
-            // Format: /dev/sda1 on / type ext4 (rw,relatime)
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 6 || parts[1] != "on" || parts[3] != "type" {
                 continue;
             }
-            
-            let device = parts[0];
+
             let mount_point = parts[2].to_string();
             let fs_type = parts[4].to_string();
             let options_str = parts[5].trim_start_matches('(').trim_end_matches(')');
             let mount_options = options_str.split(',').map(|s| s.to_string()).collect();
-            
+
             let entry = MountEntry {
                 mount_id: 0,
                 parent_id: 0,
@@ -389,10 +395,10 @@ impl Mountd {
                 optional_fields: vec![],
                 propagation_flags: vec![],
             };
-            
+
             mounts.insert(mount_point, entry);
         }
-        
+
         Ok(mounts)
     }
 
@@ -411,7 +417,9 @@ impl Mountd {
         }
     }
 
-    /// Get disk usage for a mount point
+    /// Get disk usage for a mount point. statvfs is a fast local syscall,
+    /// not a blocking network/IPC call, so this stays synchronous — it does
+    /// not warrant spawn_blocking the way subprocess calls do.
     fn get_disk_usage(mount_point: &str) -> Result<DiskUsage> {
         let c_path = CString::new(mount_point)?;
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -419,12 +427,12 @@ impl Mountd {
         if result != 0 {
             return Err(anyhow::anyhow!("statvfs failed"));
         }
-        
+
         let block_size = stat.f_frsize as u64;
         let total_blocks = stat.f_blocks as u64;
         let free_blocks = stat.f_bfree as u64;
         let available_blocks = stat.f_bavail as u64;
-        
+
         let total_bytes = total_blocks * block_size;
         let free_bytes = free_blocks * block_size;
         let available_bytes = available_blocks * block_size;
@@ -432,7 +440,7 @@ impl Mountd {
         let usage_pct = if total_bytes > 0 {
             (used_bytes as f32 / total_bytes as f32) * 100.0
         } else { 0.0 };
-        
+
         Ok(DiskUsage {
             total_bytes,
             used_bytes,
@@ -441,89 +449,132 @@ impl Mountd {
         })
     }
 
-    /// Check ZFS pool status
+    /// Check ZFS pool status. Runs zpool as a subprocess on a blocking thread.
+    /// FIX: the previous version hardcoded state to "UNKNOWN" for every pool
+    /// found and then compared "UNKNOWN" != "ONLINE" twice (a no-op duplicate
+    /// condition), which meant every ZFS pool alerted as degraded on every
+    /// single poll regardless of actual health. This version actually parses
+    /// the state field from `zpool status -x` output.
     async fn check_zfs_pools(&self) -> Result<Vec<ZfsPoolStatus>> {
-        let output = Command::new("zpool")
-            .args(["status", "-x"])
-            .output();
-        
+        let output = tokio::task::spawn_blocking(|| {
+            Command::new("zpool").args(["status", "-x"]).output()
+        }).await.context("zpool status task panicked")?;
+
         match output {
             Ok(out) if out.status.success() => {
-                // Parse zpool status output
-                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+                // "all pools are healthy" is zpool's exact message when there is
+                // nothing to report — treat that as zero pools needing attention,
+                // not as zero pools existing.
+                if stdout.trim().eq_ignore_ascii_case("all pools are healthy") {
+                    return Ok(vec![]);
+                }
+
                 let mut pools = Vec::new();
-                
+                let mut current: Option<ZfsPoolStatus> = None;
+
                 for line in stdout.lines() {
-                    if line.starts_with("pool:") {
-                        let name = line.split_whitespace().nth(1).unwrap_or("").to_string();
-                        pools.push(ZfsPoolStatus {
-                            name,
+                    let line = line.trim();
+                    if let Some(rest) = line.strip_prefix("pool:") {
+                        if let Some(p) = current.take() {
+                            pools.push(p);
+                        }
+                        current = Some(ZfsPoolStatus {
+                            name: rest.trim().to_string(),
                             state: "UNKNOWN".to_string(),
-                            scan: "".to_string(),
+                            scan: String::new(),
                             scrub_in_progress: false,
                             scrub_errors: 0,
                         });
-                    }
-                }
-                Ok(pools)
-            }
-            _ => Ok(vec![]), // zpool not available or no pools
-        }
-    }
-
-    /// Check Btrfs scrub status
-    async fn check_btrfs_scrub(&self) -> Result<Vec<BtrfsStatus>> {
-        let mut statuses = Vec::new();
-        
-        // Get mounted btrfs filesystems
-        let output = Command::new("findmnt")
-            .args(["-t", "btrfs", "-n", "-o", "TARGET"])
-            .output();
-        
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for mount_point in stdout.lines() {
-                    let mp = mount_point.trim();
-                    if mp.is_empty() { continue; }
-                    
-                    // Check scrub status
-                    let scrub_out = Command::new("btrfs")
-                        .args(["scrub", "status", mp])
-                        .output();
-                    
-                    if let Ok(scrub) = scrub_out {
-                        if scrub.status.success() {
-                            let scrub_stdout = String::from_utf8_lossy(&scrub.stdout);
-                            let scrub_running = scrub_stdout.contains("running");
-                            let mut errors = 0;
-                            let mut progress_pct = None;
-                            
-                            for line in scrub_stdout.lines() {
-                                if line.contains("errors:") {
-                                    if let Some(e) = line.split_whitespace().nth(1) {
-                                        errors = e.parse().unwrap_or(0);
-                                    }
-                                }
-                                if line.contains("progress:") {
-                                    if let Some(p) = line.split(':').nth(1) {
-                                        progress_pct = p.trim().trim_end_matches('%').parse().ok();
-                                    }
-                                }
+                    } else if let Some(rest) = line.strip_prefix("state:") {
+                        if let Some(p) = current.as_mut() {
+                            p.state = rest.trim().to_string();
+                        }
+                    } else if let Some(rest) = line.strip_prefix("scan:") {
+                        if let Some(p) = current.as_mut() {
+                            let rest = rest.trim();
+                            p.scan = rest.to_string();
+                            p.scrub_in_progress = rest.contains("scrub in progress");
+                        }
+                    } else if line.contains("errors:") {
+                        if let Some(p) = current.as_mut() {
+                            // e.g. "errors: No known data errors" or "errors: 3"
+                            if let Some(count) = line.split(':').nth(1)
+                                .and_then(|s| s.trim().parse::<u64>().ok())
+                            {
+                                p.scrub_errors = count;
                             }
-                            
-                            statuses.push(BtrfsStatus {
-                                mount_point: mp.to_string(),
-                                scrub_running,
-                                scrub_progress_pct: progress_pct,
-                                scrub_errors: errors,
-                            });
                         }
                     }
                 }
+                if let Some(p) = current.take() {
+                    pools.push(p);
+                }
+
+                Ok(pools)
+            }
+            Ok(_) => Ok(vec![]), // non-zero exit without stdout we can parse — treat as no pools
+            Err(_) => Ok(vec![]), // zpool not installed
+        }
+    }
+
+    /// Check Btrfs scrub status. Both findmnt and btrfs subprocess calls run
+    /// on a blocking thread now.
+    async fn check_btrfs_scrub(&self) -> Result<Vec<BtrfsStatus>> {
+        let findmnt_out = tokio::task::spawn_blocking(|| {
+            Command::new("findmnt").args(["-t", "btrfs", "-n", "-o", "TARGET"]).output()
+        }).await.context("findmnt task panicked")?;
+
+        let mut statuses = Vec::new();
+
+        let Ok(out) = findmnt_out else { return Ok(statuses) };
+        if !out.status.success() {
+            return Ok(statuses);
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let mount_points: Vec<String> = stdout.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        for mp in mount_points {
+            let mp_clone = mp.clone();
+            let scrub_out = tokio::task::spawn_blocking(move || {
+                Command::new("btrfs").args(["scrub", "status", &mp_clone]).output()
+            }).await.context("btrfs scrub status task panicked")?;
+
+            if let Ok(scrub) = scrub_out {
+                if scrub.status.success() {
+                    let scrub_stdout = String::from_utf8_lossy(&scrub.stdout);
+                    let scrub_running = scrub_stdout.contains("running");
+                    let mut errors = 0;
+                    let mut progress_pct = None;
+
+                    for line in scrub_stdout.lines() {
+                        if line.contains("errors:") {
+                            if let Some(e) = line.split_whitespace().nth(1) {
+                                errors = e.parse().unwrap_or(0);
+                            }
+                        }
+                        if line.contains("progress:") {
+                            if let Some(p) = line.split(':').nth(1) {
+                                progress_pct = p.trim().trim_end_matches('%').parse().ok();
+                            }
+                        }
+                    }
+
+                    statuses.push(BtrfsStatus {
+                        mount_point: mp,
+                        scrub_running,
+                        scrub_progress_pct: progress_pct,
+                        scrub_errors: errors,
+                    });
+                }
             }
         }
-        
+
         Ok(statuses)
     }
 
@@ -626,8 +677,7 @@ impl Mountd {
     /// Emit an alert via DaemonMessage::Alert with deduplication
     async fn emit_alert(&self, alert_key: &str, severity: AlertSeverity, payload: Value) -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        
-        // Check deduplication
+
         {
             let mut last_alerts = self.last_alerts.lock().await;
             if let Some((last_severity, last_time)) = last_alerts.get(alert_key) {
@@ -643,7 +693,7 @@ impl Mountd {
                         AlertSeverity::Critical => 3,
                     };
                     if severity_order <= last_order {
-                        return Ok(()); // Suppress duplicate/lower severity
+                        return Ok(());
                     }
                 }
             }
@@ -671,12 +721,12 @@ impl Mountd {
         let expected = self.expected_mounts.lock().await.clone();
         let known = self.known_mounts.lock().await.clone();
         let known_prop = self.known_propagation.lock().await.clone();
-        
-        // Check for missing expected mounts
+        let mut known_ro = self.known_readonly.lock().await.clone();
+
         for (mount_point, expected_entry) in &expected {
             if !current.contains_key(mount_point) {
                 let severity = expected_entry.alert_severity.as_ref().cloned().unwrap_or(AlertSeverity::Critical);
-                self.emit_alert(&format!("mount_missing_{}", mount_point.replace('/', "_")), 
+                self.emit_alert(&format!("mount_missing_{}", mount_point.replace('/', "_")),
                     severity, json!({
                         "alert_type": MountAlertType::MountMissing.as_str(),
                         "metric": "mount_missing",
@@ -687,8 +737,7 @@ impl Mountd {
                     })).await?;
             } else {
                 let current_entry = &current[mount_point];
-                
-                // Check filesystem type matches
+
                 if current_entry.fs_type != expected_entry.fs_type && expected_entry.alert_on_fs_mismatch {
                     self.emit_alert(&format!("mount_fs_mismatch_{}", mount_point.replace('/', "_")),
                         AlertSeverity::Warning, json!({
@@ -700,8 +749,7 @@ impl Mountd {
                             "message": format!("Filesystem type mismatch on {}: expected {}, got {}", mount_point, expected_entry.fs_type, current_entry.fs_type),
                         })).await?;
                 }
-                
-                // Check mount options if alert_on_options_change
+
                 if expected_entry.alert_on_options_change && current_entry.mount_options != expected_entry.options {
                     self.emit_alert(&format!("mount_options_changed_{}", mount_point.replace('/', "_")),
                         AlertSeverity::Warning, json!({
@@ -713,8 +761,7 @@ impl Mountd {
                             "message": format!("Mount options changed on {}", mount_point),
                         })).await?;
                 }
-                
-                // Check propagation flags changed
+
                 if let Some(known_flags) = known_prop.get(mount_point) {
                     if known_flags != &current_entry.propagation_flags && !current_entry.propagation_flags.is_empty() {
                         self.emit_alert(&format!("mount_prop_changed_{}", mount_point.replace('/', "_")),
@@ -728,12 +775,11 @@ impl Mountd {
                             })).await?;
                     }
                 }
-                
-                // Check disk usage
+
                 if let Ok(usage) = Self::get_disk_usage(mount_point) {
                     let warning_pct = expected_entry.disk_warning_pct.unwrap_or(self.config.disk_usage_warning_pct);
                     let critical_pct = expected_entry.disk_critical_pct.unwrap_or(self.config.disk_usage_critical_pct);
-                    
+
                     if usage.usage_pct >= critical_pct {
                         self.emit_alert(&format!("disk_critical_{}", mount_point.replace('/', "_")),
                             AlertSeverity::Critical, json!({
@@ -761,27 +807,32 @@ impl Mountd {
                                 "message": format!("Disk usage high on {}: {:.1}%", mount_point, usage.usage_pct),
                             })).await?;
                     }
-                    
-                    // Check if filesystem is read-only
-                    if current_entry.mount_options.contains(&"ro".to_string()) {
-                        self.emit_alert(&format!("fs_readonly_{}", mount_point.replace('/', "_")),
-                            AlertSeverity::Warning, json!({
-                                "alert_type": MountAlertType::FilesystemReadOnly.as_str(),
-                                "metric": "filesystem_readonly",
-                                "mount_point": mount_point,
-                                "message": format!("Filesystem {} is mounted read-only", mount_point),
-                            })).await?;
-                    }
                 }
+
+                // FIX: only alert on the *transition* into read-only, and never
+                // for a mount that's expected to be read-only per fstab (e.g.
+                // an intentional ro boot partition). Previously this fired
+                // every poll cycle (~every 30s) forever for any ro mount.
+                let is_ro_now = current_entry.mount_options.contains(&"ro".to_string());
+                let was_ro_before = known_ro.get(mount_point).copied().unwrap_or(false);
+
+                if is_ro_now && !was_ro_before && !expected_entry.expected_readonly {
+                    self.emit_alert(&format!("fs_readonly_{}", mount_point.replace('/', "_")),
+                        AlertSeverity::Warning, json!({
+                            "alert_type": MountAlertType::FilesystemReadOnly.as_str(),
+                            "metric": "filesystem_readonly",
+                            "mount_point": mount_point,
+                            "message": format!("Filesystem {} became read-only unexpectedly", mount_point),
+                        })).await?;
+                }
+                known_ro.insert(mount_point.clone(), is_ro_now);
             }
         }
-        
-        // Check for unexpected mounts (not in fstab but mounted)
+
         for (mount_point, current_entry) in &current {
             if !expected.contains_key(mount_point) {
-                // Skip virtual filesystems
-                if !matches!(current_entry.fs_type.as_str(), 
-                    "proc" | "sysfs" | "devpts" | "tmpfs" | "devtmpfs" | "cgroup" | "cgroup2" | 
+                if !matches!(current_entry.fs_type.as_str(),
+                    "proc" | "sysfs" | "devpts" | "tmpfs" | "devtmpfs" | "cgroup" | "cgroup2" |
                     "pstore" | "bpf" | "autofs" | "mqueue" | "configfs" | "debugfs" | "tracefs" |
                     "securityfs" | "selinuxfs" | "efivarfs" | "hugetlbfs" | "fusectl" | "fuse.gvfsd-fuse" |
                     "overlay" | "squashfs" | "iso9660" | "udf") {
@@ -797,8 +848,7 @@ impl Mountd {
                 }
             }
         }
-        
-        // Check for disappeared mounts (was in known, now gone, and was expected)
+
         for (mount_point, _known_entry) in &known {
             if !current.contains_key(mount_point) && expected.contains_key(mount_point) {
                 self.emit_alert(&format!("mount_disappeared_{}", mount_point.replace('/', "_")),
@@ -810,11 +860,12 @@ impl Mountd {
                     })).await?;
             }
         }
-        
-        // Check ZFS pools
+
+        // FIX: real state parsing means this now only fires for pools that are
+        // genuinely not ONLINE, instead of every pool on every poll.
         if let Ok(pools) = self.check_zfs_pools().await {
             for pool in pools {
-                if pool.state != "ONLINE" && pool.state != "ONLINE" {
+                if pool.state != "ONLINE" && pool.state != "UNKNOWN" {
                     self.emit_alert(&format!("zfs_pool_degraded_{}", pool.name),
                         AlertSeverity::Critical, json!({
                             "alert_type": MountAlertType::ZfsPoolDegraded.as_str(),
@@ -846,8 +897,7 @@ impl Mountd {
                 }
             }
         }
-        
-        // Check Btrfs scrub
+
         if let Ok(btrfs_statuses) = self.check_btrfs_scrub().await {
             for status in btrfs_statuses {
                 if status.scrub_running && self.config.btrfs_scrub_alert {
@@ -872,8 +922,7 @@ impl Mountd {
                 }
             }
         }
-        
-        // Update known mounts and propagation
+
         *self.known_mounts.lock().await = current.clone();
         let mut new_prop = HashMap::new();
         for (mp, entry) in &current {
@@ -882,14 +931,14 @@ impl Mountd {
             }
         }
         *self.known_propagation.lock().await = new_prop;
-        
-        // Periodic status update
+        *self.known_readonly.lock().await = known_ro;
+
         let status = DaemonMessage::StatusUpdate {
             name: self.daemon_name.clone(),
             status: DaemonStatus::Running,
         };
         self.send_frame(status).await?;
-        
+
         Ok(())
     }
 }
@@ -904,25 +953,23 @@ async fn main() -> Result<()> {
     mountd.connect_to_bridge().await?;
     mountd.register().await?;
 
-    // Wait for acknowledgment with timeout
-    tokio::time::timeout(Duration::from_millis(mountd.config.registration_timeout_ms), async {
-        let mut interval = interval(Duration::from_millis(100));
+    tokio::time::timeout(std::time::Duration::from_millis(mountd.config.registration_timeout_ms), async {
+        let mut interval = interval(std::time::Duration::from_millis(100));
         loop {
             interval.tick().await;
             if let Err(e) = mountd.handle_bridge_messages().await {
                 debug!("[mountd] Bridge message handler error: {}", e);
             }
         }
-    }).await.ok(); // Ignore timeout, continue if registered
+    }).await.ok();
 
     info!("[mountd] Registration complete, entering monitoring loop");
 
-    // Main monitoring loop
     let poll_interval_ms = mountd.config.poll_interval_ms;
     let flush_interval_ms = mountd.config.flush_interval_ms;
-    
-    let mut poll_interval = interval(Duration::from_millis(poll_interval_ms));
-    let mut flush_interval = interval(Duration::from_millis(flush_interval_ms));
+
+    let mut poll_interval = interval(std::time::Duration::from_millis(poll_interval_ms));
+    let mut flush_interval = interval(std::time::Duration::from_millis(flush_interval_ms));
 
     loop {
         tokio::select! {

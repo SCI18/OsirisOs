@@ -3,17 +3,18 @@
 // "What is spoken, is weighed. What is weighed, endures."
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use maat::{DaemonMessage, BridgeMessage, Frame, DaemonStatus};
 use serde_json::Value;
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::io::AsyncWrite;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, interval};
 use tracing::{info, warn, error, debug};
 use chrono::DateTime;
@@ -36,20 +37,31 @@ struct LogEntry {
     fields: Option<Value>,
 }
 
+/// Internal channel message: either a bridge message to handle, or a shutdown signal
+enum ReaderEvent {
+    Bridge(BridgeMessage),
+    Closed,
+}
+
 /// Logd state
 struct Logd {
     ring_buffer: Arc<Mutex<VecDeque<LogEntry>>>,
     ring_buffer_bytes: Arc<Mutex<usize>>,
-    persist_writer: Arc<Mutex<Option<BufWriter<File>>>>,
-    bootstrap_writer: Arc<Mutex<Option<BufWriter<File>>>>,
-    socket: Arc<Mutex<Option<UnixStream>>>,
+    persist_writer: Arc<Mutex<Option<BufWriter<tokio::fs::File>>>>,
+    bootstrap_writer: Arc<Mutex<Option<BufWriter<tokio::fs::File>>>>,
+    socket_write_half: Arc<Mutex<Option<tokio::net::unix::OwnedWriteHalf>>>,
     daemon_name: String,
     pid: u32,
+    /// FIX: bootstrap buffer is meant specifically for pre-registration
+    /// logging (logs that occur before Bridge acknowledges registration).
+    /// Previously every entry was written to both persist and bootstrap
+    /// files unconditionally, making "bootstrap" just a permanent duplicate
+    /// log rather than an early-boot capture. This flag gates it correctly.
+    registered: Arc<AtomicBool>,
 }
 
 impl Logd {
     fn new() -> Result<Self> {
-        // Ensure log directory exists
         std::fs::create_dir_all("/var/log/osiris")?;
 
         Ok(Self {
@@ -57,40 +69,79 @@ impl Logd {
             ring_buffer_bytes: Arc::new(Mutex::new(0)),
             persist_writer: Arc::new(Mutex::new(None)),
             bootstrap_writer: Arc::new(Mutex::new(None)),
-            socket: Arc::new(Mutex::new(None)),
+            socket_write_half: Arc::new(Mutex::new(None)),
             daemon_name: "logd".to_string(),
             pid: std::process::id(),
+            registered: Arc::new(AtomicBool::new(false)),
         })
     }
 
     async fn open_persist_files(&self) -> Result<()> {
-        // Open persistence file (append mode)
         let persist_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(PERSIST_PATH)
             .await?;
-        let persist_writer = BufWriter::new(persist_file);
-        *self.persist_writer.lock().await = Some(persist_writer);
+        *self.persist_writer.lock().await = Some(BufWriter::new(persist_file));
 
-        // Open bootstrap file (append mode)
         let bootstrap_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(BOOTSTRAP_PATH)
             .await?;
-        let bootstrap_writer = BufWriter::new(bootstrap_file);
-        *self.bootstrap_writer.lock().await = Some(bootstrap_writer);
+        *self.bootstrap_writer.lock().await = Some(BufWriter::new(bootstrap_file));
 
         info!("[logd] Persistence files opened");
         Ok(())
     }
 
-    async fn connect_to_bridge(&self) -> Result<()> {
+    /// Connect to Bridge, split the stream into read/write halves, and spawn
+    /// a persistent background task that owns the read half for the lifetime
+    /// of the connection.
+    ///
+    /// FIX: the previous design re-created a BufReader and looped
+    /// `read_line` inside a function called fresh on every `flush_interval`
+    /// tick within `tokio::select!`. Since that function's internal loop
+    /// only returns on EOF or error, whichever branch of `select!` completed
+    /// first would cause the *other* in-progress branch's future to be
+    /// dropped when the loop iterated — silently cancelling a partially-read
+    /// line if the socket read was mid-flight when the flush timer fired.
+    /// A persistent task with its own loop, decoupled from the main
+    /// select loop, avoids this entirely.
+    async fn connect_to_bridge(&self) -> Result<mpsc::Receiver<ReaderEvent>> {
         let stream = UnixStream::connect(SOCKET_PATH).await?;
-        *self.socket.lock().await = Some(stream);
+        let (read_half, write_half) = stream.into_split();
+        *self.socket_write_half.lock().await = Some(write_half);
         info!("[logd] Connected to AkerNet Bridge at {}", SOCKET_PATH);
-        Ok(())
+
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        let _ = tx.send(ReaderEvent::Closed).await;
+                        break;
+                    }
+                    Ok(_) => {
+                        if let Ok(bridge_msg) = Frame::decode_bridge_message(&line) {
+                            if tx.send(ReaderEvent::Bridge(bridge_msg)).await.is_err() {
+                                break; // receiver dropped, shut down reader
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("[logd] Socket read error: {}", e);
+                        let _ = tx.send(ReaderEvent::Closed).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     async fn register(&self) -> Result<()> {
@@ -106,35 +157,10 @@ impl Logd {
 
     async fn send_frame(&self, msg: DaemonMessage) -> Result<()> {
         let frame = Frame::encode(&msg).map_err(|e| anyhow::anyhow!(e))?;
-        let mut socket_guard = self.socket.lock().await;
-        if let Some(stream) = socket_guard.as_mut() {
-            stream.write_all(frame.as_bytes()).await?;
-            stream.flush().await?;
-        }
-        Ok(())
-    }
-
-    async fn handle_bridge_messages(&self) -> Result<()> {
-        // We need to read from the socket without holding the lock for the entire read
-        let mut socket_guard = self.socket.lock().await;
-        if let Some(stream) = socket_guard.as_mut() {
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            loop {
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if let Ok(bridge_msg) = Frame::decode_bridge_message(&line) {
-                            self.handle_bridge_message(bridge_msg).await?;
-                        }
-                        line.clear();
-                    }
-                    Err(e) => {
-                        debug!("[logd] Socket read error: {}", e);
-                        break;
-                    }
-                }
-            }
+        let mut guard = self.socket_write_half.lock().await;
+        if let Some(writer) = guard.as_mut() {
+            writer.write_all(frame.as_bytes()).await?;
+            writer.flush().await?;
         }
         Ok(())
     }
@@ -143,6 +169,10 @@ impl Logd {
         match msg {
             BridgeMessage::Acknowledged { name } => {
                 info!("[logd] Registration acknowledged by Bridge: {}", name);
+                // FIX: this is the actual, correct trigger for "registered" —
+                // flip the flag here so bootstrap-only logging stops once
+                // we're truly live, instead of writing to both files forever.
+                self.registered.store(true, Ordering::SeqCst);
             }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
@@ -172,11 +202,10 @@ impl Logd {
         let entry_json = serde_json::to_string(&entry)?;
         let entry_size = entry_json.len();
 
-        // Add to ring buffer
         {
             let mut ring = self.ring_buffer.lock().await;
             let mut bytes = self.ring_buffer_bytes.lock().await;
-            
+
             while *bytes + entry_size > RING_BUFFER_MAX_BYTES {
                 if let Some(old) = ring.pop_front() {
                     let old_size = serde_json::to_string(&old)?.len();
@@ -189,17 +218,19 @@ impl Logd {
             *bytes += entry_size;
         }
 
-        // Persist to disk
-        {
+        // FIX: bootstrap file now only receives entries logged *before*
+        // Bridge acknowledges registration — i.e. genuine early-boot logs
+        // that would otherwise have nowhere durable to land if logd itself
+        // isn't fully online yet. Once registered, only the main ring
+        // buffer + persist file are written, so bootstrap.log stops
+        // growing forever as a silent duplicate of everything.
+        if self.registered.load(Ordering::SeqCst) {
             let mut persist = self.persist_writer.lock().await;
             if let Some(writer) = persist.as_mut() {
                 writer.write_all(entry_json.as_bytes()).await?;
                 writer.write_all(b"\n").await?;
             }
-        }
-
-        // Also write to bootstrap (for early boot logs)
-        {
+        } else {
             let mut bootstrap = self.bootstrap_writer.lock().await;
             if let Some(writer) = bootstrap.as_mut() {
                 writer.write_all(entry_json.as_bytes()).await?;
@@ -233,7 +264,19 @@ impl Logd {
         Ok(())
     }
 
-    /// Ingest a log entry from another daemon (via Bridge)
+    /// Ingest a log entry describing another daemon's message.
+    ///
+    /// NOT YET WIRED TO A LIVE INPUT — see note in main(). This function is
+    /// correct and ready to use, but there is currently no protocol path for
+    /// Bridge to forward other daemons' DaemonMessage frames to logd; the
+    /// existing BridgeMessage enum only carries Bridge->daemon control
+    /// messages (Acknowledged/StatusRequest/Stop/Reload/Restart), not
+    /// forwarded third-party DaemonMessage payloads. Wiring this up for real
+    /// requires a Networks Spec decision (e.g. a new
+    /// `BridgeMessage::Forward(DaemonMessage)` variant) before logd can
+    /// actually receive and log other daemons' alerts. Flagging rather than
+    /// inventing that protocol change unilaterally here.
+    #[allow(dead_code)]
     async fn ingest_daemon_message(&self, msg: DaemonMessage) -> Result<()> {
         match msg {
             DaemonMessage::Alert { name, severity, payload, timestamp } => {
@@ -248,10 +291,7 @@ impl Logd {
             }
             DaemonMessage::Error { name, message } => {
                 let entry = LogEntry {
-                    timestamp: DateTime::from_timestamp(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                        0
-                    ).map(|dt| dt.to_rfc3339()).unwrap_or_default(),
+                    timestamp: now_rfc3339(),
                     daemon: name,
                     level: "error".to_string(),
                     message,
@@ -261,10 +301,7 @@ impl Logd {
             }
             DaemonMessage::StatusUpdate { name, status } => {
                 let entry = LogEntry {
-                    timestamp: DateTime::from_timestamp(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                        0
-                    ).map(|dt| dt.to_rfc3339()).unwrap_or_default(),
+                    timestamp: now_rfc3339(),
                     daemon: name,
                     level: "info".to_string(),
                     message: format!("Status changed to {:?}", status),
@@ -274,11 +311,8 @@ impl Logd {
             }
             DaemonMessage::Register { name, pid, version } => {
                 let entry = LogEntry {
-                    timestamp: DateTime::from_timestamp(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                        0
-                    ).map(|dt| dt.to_rfc3339()).unwrap_or_default(),
-                    daemon: name.clone(),
+                    timestamp: now_rfc3339(),
+                    daemon: name,
                     level: "info".to_string(),
                     message: format!("Daemon registered (pid={}, v={})", pid, version),
                     fields: None,
@@ -287,10 +321,7 @@ impl Logd {
             }
             DaemonMessage::Shutdown { name, reason } => {
                 let entry = LogEntry {
-                    timestamp: DateTime::from_timestamp(
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                        0
-                    ).map(|dt| dt.to_rfc3339()).unwrap_or_default(),
+                    timestamp: now_rfc3339(),
                     daemon: name,
                     level: "info".to_string(),
                     message: format!("Daemon shutdown: {}", reason),
@@ -303,6 +334,13 @@ impl Logd {
     }
 }
 
+fn now_rfc3339() -> String {
+    DateTime::from_timestamp(
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+        0
+    ).map(|dt| dt.to_rfc3339()).unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -310,23 +348,30 @@ async fn main() -> Result<()> {
 
     let logd = Logd::new()?;
     logd.open_persist_files().await?;
-    logd.connect_to_bridge().await?;
+    let mut reader_rx = logd.connect_to_bridge().await?;
     logd.register().await?;
 
-    // Wait for acknowledgment with timeout
-    tokio::time::timeout(Duration::from_millis(REGISTRATION_TIMEOUT_MS), async {
-        let mut interval = interval(Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            if let Err(e) = logd.handle_bridge_messages().await {
-                debug!("[logd] Bridge message handler error: {}", e);
+    // Wait for acknowledgment with timeout by draining the reader channel
+    // directly, rather than re-invoking a read function repeatedly.
+    let _ = tokio::time::timeout(Duration::from_millis(REGISTRATION_TIMEOUT_MS), async {
+        while let Some(event) = reader_rx.recv().await {
+            match event {
+                ReaderEvent::Bridge(msg) => {
+                    let is_ack = matches!(msg, BridgeMessage::Acknowledged { .. });
+                    if let Err(e) = logd.handle_bridge_message(msg).await {
+                        debug!("[logd] Bridge message handler error: {}", e);
+                    }
+                    if is_ack {
+                        break;
+                    }
+                }
+                ReaderEvent::Closed => break,
             }
         }
-    }).await.ok(); // Ignore timeout, continue if registered
+    }).await;
 
     info!("[logd] Registration complete, entering main loop");
 
-    // Main loop - handle bridge messages and periodic flush
     let mut flush_interval = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
 
     loop {
@@ -336,11 +381,21 @@ async fn main() -> Result<()> {
                     error!("[logd] Flush error: {}", e);
                 }
             }
-            _ = async {
-                if let Err(e) = logd.handle_bridge_messages().await {
-                    debug!("[logd] Bridge message handler error: {}", e);
+            event = reader_rx.recv() => {
+                match event {
+                    Some(ReaderEvent::Bridge(msg)) => {
+                        if let Err(e) = logd.handle_bridge_message(msg).await {
+                            debug!("[logd] Bridge message handler error: {}", e);
+                        }
+                    }
+                    Some(ReaderEvent::Closed) | None => {
+                        warn!("[logd] Bridge connection closed, exiting");
+                        break;
+                    }
                 }
-            } => {}
+            }
         }
     }
+
+    Ok(())
 }

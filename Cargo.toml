@@ -17,6 +17,7 @@ members = [
     "daemons/system_core/timed",
     "daemons/system_core/mountd",
     "daemons/system_core/entropyd",
+    "daemons/system_core/kha-watchd",
 ]
 
 # Shared dependencies across all workspace members
