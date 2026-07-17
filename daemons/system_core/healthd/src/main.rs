@@ -10,7 +10,7 @@ use anyhow::Result;
 use chrono::DateTime;
 use maat::{DaemonMessage, BridgeMessage, Frame, DaemonStatus, AlertSeverity};
 use serde_json::{json, Value};
-use sysinfo::System;
+use sysinfo::{System, Disks};
 use tokio::net::UnixStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -36,6 +36,7 @@ const DISK_CRITICAL_THRESHOLD: f32 = 95.0;
 /// Healthd state
 struct Healthd {
     system: Arc<Mutex<System>>,
+    disks: Arc<Mutex<Disks>>,
     socket: Arc<Mutex<Option<UnixStream>>>,
     daemon_name: String,
     pid: u32,
@@ -46,9 +47,12 @@ impl Healthd {
     fn new() -> Result<Self> {
         let mut system = System::new_all();
         system.refresh_all();
+        
+        let mut disks = Disks::new_with_refreshed_list();
 
         Ok(Self {
             system: Arc::new(Mutex::new(system)),
+            disks: Arc::new(Mutex::new(disks)),
             socket: Arc::new(Mutex::new(None)),
             daemon_name: "healthd".to_string(),
             pid: std::process::id(),
@@ -202,18 +206,26 @@ impl Healthd {
         // Refresh system info
         {
             let mut sys = self.system.lock().await;
-            sys.refresh_cpu_all();
+            sys.refresh_cpu();
             sys.refresh_memory();
-            sys.refresh_disks_list();
-            sys.refresh_disks();
+        }
+        
+        // Refresh disks separately
+        {
+            let mut disks = self.disks.lock().await;
+            disks.refresh_list();
+            disks.refresh();
         }
 
         // Collect metrics under lock
         let (cpu_usage, memory_usage, memory_total, disk_usages) = {
             let sys = self.system.lock().await;
             
-            // CPU - global usage
-            let cpu_usage = sys.global_cpu_usage();
+            // CPU - global usage (average of all CPUs)
+            let cpus = sys.cpus();
+            let cpu_usage = if !cpus.is_empty() {
+                cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
+            } else { 0.0 };
             
             // Memory
             let memory_used = sys.used_memory();
@@ -222,9 +234,10 @@ impl Healthd {
                 (memory_used as f32 / memory_total as f32) * 100.0
             } else { 0.0 };
             
-            // Disks
+            // Disks - use the Disks struct
+            let disks = self.disks.lock().await;
             let mut disk_usages = Vec::new();
-            for disk in sys.disks() {
+            for disk in disks.list() {
                 let total = disk.total_space();
                 let available = disk.available_space();
                 if total > 0 {

@@ -1,0 +1,22 @@
+[package]
+name        = "timed"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Assessor #4 — System time, NTP synchronization"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "timed"
+path = "src/main.rs"
+
+[dependencies]
+maat       = { path = "../../../maat" }
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono     = { workspace = true }
+ntp        = "0.3"

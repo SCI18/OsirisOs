@@ -12,8 +12,11 @@ members = [
     "harvester",
     "anubis",
     "thoth",
-    "logd",
-    "healthd",
+    "daemons/system_core/logd",
+    "daemons/system_core/healthd",
+    "daemons/system_core/timed",
+    "daemons/system_core/mountd",
+    "daemons/system_core/entropyd",
 ]
 
 # Shared dependencies across all workspace members

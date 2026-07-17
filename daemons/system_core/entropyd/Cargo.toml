@@ -1,0 +1,21 @@
+[package]
+name        = "entropyd"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Assessor #5 — Entropy pool management, RNG seeding"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "entropyd"
+path = "src/main.rs"
+
+[dependencies]
+maat       = { path = "../../../maat" }
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono     = { workspace = true }

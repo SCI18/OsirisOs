@@ -1,16 +1,16 @@
 [package]
-name        = "healthd"
+name        = "logd"
 version     = "0.1.0-alpha"
 edition     = "2021"
-description = "Assessor #3 — CPU/RAM/thermal monitoring, threshold alerts"
+description = "Assessor #2 — Unified system logging, ring buffer, hybrid persistence"
 authors     = ["droidmaster"]
 
 [[bin]]
-name = "healthd"
+name = "logd"
 path = "src/main.rs"
 
 [dependencies]
-maat       = { path = "../maat" }
+maat       = { path = "../../../maat" }
 tokio      = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
@@ -18,5 +18,4 @@ anyhow     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 tracing-subscriber = { workspace = true }
-sysinfo    = { workspace = true }
 chrono     = { workspace = true }
