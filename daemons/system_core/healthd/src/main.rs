@@ -179,6 +179,10 @@ impl Healthd {
             BridgeMessage::Acknowledged { name } => {
                 info!("[healthd] Registration acknowledged by Bridge: {}", name);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[healthd] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -200,6 +204,10 @@ impl Healthd {
                 info!("[healthd] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(_) => {
+                // healthd doesn't forward messages
+                debug!("[healthd] Received unexpected Forward message, ignoring");
             }
         }
         Ok(())

@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "akernet-bridge"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
+ "libc",
  "maat",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -477,6 +477,10 @@ name = "kha"
 version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
+ "libc",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

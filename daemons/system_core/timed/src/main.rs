@@ -123,6 +123,10 @@ impl Timed {
             BridgeMessage::Acknowledged { name } => {
                 info!("[timed] Registration acknowledged by Bridge: {}", name);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[timed] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -142,6 +146,10 @@ impl Timed {
                 info!("[timed] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(_) => {
+                // timed doesn't forward messages
+                debug!("[timed] Received unexpected Forward message, ignoring");
             }
         }
         Ok(())

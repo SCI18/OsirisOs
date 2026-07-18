@@ -66,6 +66,13 @@ pub enum BridgeMessage {
     Acknowledged {
         name: String,
     },
+    /// FIX (fpo.md Finding 3/8): Bridge rejects a registration whose claimed
+    /// PID does not match the connecting process's real, kernel-verified
+    /// PID (via SO_PEERCRED). The connection is closed after this is sent.
+    RegistrationRejected {
+        name:   String,
+        reason: String,
+    },
     /// Bridge requests daemon status
     StatusRequest,
     /// Bridge instructs daemon to stop gracefully
@@ -74,6 +81,10 @@ pub enum BridgeMessage {
     Reload,
     /// Bridge instructs daemon to restart
     Restart,
+    /// FIX (logd forwarding gap, approved by Networks Spec in nsp.md):
+    /// Bridge forwards another daemon's message to logd for durable
+    /// logging. Only sent to logd's connection specifically.
+    Forward(DaemonMessage),
 }
 
 /// A framed message for Unix socket transport

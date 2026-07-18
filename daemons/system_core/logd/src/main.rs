@@ -174,6 +174,10 @@ impl Logd {
                 // we're truly live, instead of writing to both files forever.
                 self.registered.store(true, Ordering::SeqCst);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[logd] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -193,6 +197,12 @@ impl Logd {
                 info!("[logd] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(daemon_msg) => {
+                // Handle forwarded daemon messages (Alert, Error, StatusUpdate, Register, Shutdown)
+                if let Err(e) = self.ingest_daemon_message(daemon_msg).await {
+                    error!("[logd] Failed to ingest forwarded daemon message: {}", e);
+                }
             }
         }
         Ok(())
@@ -266,17 +276,8 @@ impl Logd {
 
     /// Ingest a log entry describing another daemon's message.
     ///
-    /// NOT YET WIRED TO A LIVE INPUT — see note in main(). This function is
-    /// correct and ready to use, but there is currently no protocol path for
-    /// Bridge to forward other daemons' DaemonMessage frames to logd; the
-    /// existing BridgeMessage enum only carries Bridge->daemon control
-    /// messages (Acknowledged/StatusRequest/Stop/Reload/Restart), not
-    /// forwarded third-party DaemonMessage payloads. Wiring this up for real
-    /// requires a Networks Spec decision (e.g. a new
-    /// `BridgeMessage::Forward(DaemonMessage)` variant) before logd can
-    /// actually receive and log other daemons' alerts. Flagging rather than
-    /// inventing that protocol change unilaterally here.
-    #[allow(dead_code)]
+    /// Handles forwarded daemon messages (Alert, Error, StatusUpdate, Register, Shutdown)
+    /// from the Bridge via the `BridgeMessage::Forward` variant.
     async fn ingest_daemon_message(&self, msg: DaemonMessage) -> Result<()> {
         match msg {
             DaemonMessage::Alert { name, severity, payload, timestamp } => {

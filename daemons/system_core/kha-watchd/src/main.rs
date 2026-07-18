@@ -248,6 +248,10 @@ impl KhaWatchd {
             BridgeMessage::Acknowledged { name } => {
                 info!("[kha-watchd] Registration acknowledged by Bridge: {}", name);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[kha-watchd] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -267,6 +271,10 @@ impl KhaWatchd {
                 info!("[kha-watchd] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(_) => {
+                // kha-watchd doesn't forward messages
+                debug!("[kha-watchd] Received unexpected Forward message, ignoring");
             }
         }
         Ok(())

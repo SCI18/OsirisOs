@@ -138,6 +138,10 @@ impl Entropyd {
             BridgeMessage::Acknowledged { name } => {
                 info!("[entropyd] Registration acknowledged by Bridge: {}", name);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[entropyd] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -157,6 +161,10 @@ impl Entropyd {
                 info!("[entropyd] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(_) => {
+                // entropyd doesn't forward messages
+                debug!("[entropyd] Received unexpected Forward message, ignoring");
             }
         }
         Ok(())

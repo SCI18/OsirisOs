@@ -278,11 +278,16 @@ impl DaemonRegistry {
                     DaemonDomain::Services,
                     vec!["logd", "netd", "permd"],
                 ),
+                // FIX (fpo.md Finding 6): removed "opium" from depends_on.
+                // OPIUM is a CLI package-manager binary, not a daemon that
+                // registers with Bridge — it can never appear in the
+                // `running` list, so this daemon could structurally never
+                // become ready to spawn while the dependency remained.
                 DaemonInfo::new(
                     42, "updated",
                     "OPIUM update checks, delta patching",
                     DaemonDomain::Services,
-                    vec!["logd", "netd", "opium"],
+                    vec!["logd", "netd"],
                 ),
             ],
         }
@@ -291,6 +296,11 @@ impl DaemonRegistry {
     /// Get a daemon by name
     pub fn get(&self, name: &str) -> Option<&DaemonInfo> {
         self.daemons.iter().find(|d| d.name == name)
+    }
+
+    /// Get a daemon by name, mutably
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut DaemonInfo> {
+        self.daemons.iter_mut().find(|d| d.name == name)
     }
 
     /// Get all daemons in a domain
@@ -305,6 +315,19 @@ impl DaemonRegistry {
             .filter(|d| {
                 d.status == DaemonStatus::Pending
                     && d.is_ready_to_spawn(running)
+            })
+            .collect()
+    }
+
+    /// FIX (fpo.md Finding 1): daemons eligible for a restart attempt —
+    /// Failed or Stopped, restartable, and under the retry ceiling.
+    pub fn ready_to_restart(&self, max_restarts: u32) -> Vec<&DaemonInfo> {
+        self.daemons
+            .iter()
+            .filter(|d| {
+                (d.status == DaemonStatus::Failed || d.status == DaemonStatus::Stopped)
+                    && d.restartable
+                    && d.restart_count < max_restarts
             })
             .collect()
     }
@@ -332,9 +355,10 @@ impl DaemonRegistry {
         let pending  = self.daemons.iter().filter(|d| d.status == DaemonStatus::Pending).count();
         let failed   = self.daemons.iter().filter(|d| d.status == DaemonStatus::Failed).count();
         let stopped  = self.daemons.iter().filter(|d| d.status == DaemonStatus::Stopped).count();
+        let restarting = self.daemons.iter().filter(|d| d.status == DaemonStatus::Restarting).count();
         format!(
-            "running={} pending={} failed={} stopped={}",
-            running, pending, failed, stopped
+            "running={} pending={} failed={} stopped={} restarting={}",
+            running, pending, failed, stopped, restarting
         )
     }
 }

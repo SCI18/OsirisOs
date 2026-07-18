@@ -1,4 +1,4 @@
- mountd — Assessor #6, SystemCore
+ // mountd - Assessor #6, SystemCore
 // Filesystem mount management post-boot
 // "Mounts are weighed. The unmounted are known."
 
@@ -354,6 +354,44 @@ impl Mountd {
         Ok(mounts)
     }
 
+    /// Fallback mount parsing using /proc/mounts (kernel-provided, works in
+    /// proot where mountinfo may be empty but mounts is populated).
+    /// Format: device mount_point fstype options dump pass
+    async fn parse_mounts(&self) -> Result<HashMap<String, MountEntry>> {
+        let content = fs::read_to_string("/proc/mounts")?;
+        let mut mounts = HashMap::new();
+
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+
+            let device = parts[0].to_string();
+            let mount_point = parts[1].to_string();
+            let fs_type = parts[2].to_string();
+            let options_str = parts[3];
+            let mount_options = options_str.split(',').map(|s| s.to_string()).collect();
+
+            let entry = MountEntry {
+                mount_id: 0,
+                parent_id: 0,
+                major: 0,
+                minor: 0,
+                root: "/".to_string(),
+                mount_point: mount_point.clone(),
+                fs_type,
+                mount_options,
+                optional_fields: vec![],
+                propagation_flags: vec![],
+            };
+
+            mounts.insert(mount_point, entry);
+        }
+
+        Ok(mounts)
+    }
+
     /// Fallback mount parsing using `mount` command (for proot environments).
     /// Runs the subprocess on a blocking thread since Command::output() is
     /// synchronous and would otherwise stall the tokio worker thread.
@@ -402,16 +440,21 @@ impl Mountd {
         Ok(mounts)
     }
 
-    /// Get current mounts (try mountinfo first, fallback to mount command)
+    /// Get current mounts (try mountinfo first, then /proc/mounts, fallback to mount command)
     async fn get_current_mounts(&self) -> Result<HashMap<String, MountEntry>> {
         match self.parse_mountinfo().await {
             Ok(mounts) if !mounts.is_empty() => Ok(mounts),
             _ => {
-                if self.config.proot_fallback {
-                    warn!("[mountd] mountinfo empty/failed, falling back to mount command");
-                    self.parse_mount_cmd().await
-                } else {
-                    self.parse_mountinfo().await
+                match self.parse_mounts().await {
+                    Ok(mounts) if !mounts.is_empty() => Ok(mounts),
+                    _ => {
+                        if self.config.proot_fallback {
+                            warn!("[mountd] mountinfo and /proc/mounts empty/failed, falling back to mount command");
+                            self.parse_mount_cmd().await
+                        } else {
+                            self.parse_mountinfo().await
+                        }
+                    }
                 }
             }
         }
@@ -638,6 +681,10 @@ impl Mountd {
             BridgeMessage::Acknowledged { name } => {
                 info!("[mountd] Registration acknowledged by Bridge: {}", name);
             }
+            BridgeMessage::RegistrationRejected { name, reason } => {
+                error!("[mountd] Registration rejected: {} — {}", name, reason);
+                std::process::exit(1);
+            }
             BridgeMessage::StatusRequest => {
                 let status = DaemonMessage::StatusUpdate {
                     name: self.daemon_name.clone(),
@@ -659,6 +706,10 @@ impl Mountd {
                 info!("[mountd] Received Restart from Bridge");
                 self.shutdown().await?;
                 std::process::exit(0);
+            }
+            BridgeMessage::Forward(_) => {
+                // mountd doesn't forward messages
+                debug!("[mountd] Received unexpected Forward message, ignoring");
             }
         }
         Ok(())
@@ -818,7 +869,7 @@ impl Mountd {
 
                 if is_ro_now && !was_ro_before && !expected_entry.expected_readonly {
                     self.emit_alert(&format!("fs_readonly_{}", mount_point.replace('/', "_")),
-                        AlertSeverity::Warning, json!({
+                        AlertSeverity::Critical, json!({
                             "alert_type": MountAlertType::FilesystemReadOnly.as_str(),
                             "metric": "filesystem_readonly",
                             "mount_point": mount_point,
@@ -837,7 +888,7 @@ impl Mountd {
                     "securityfs" | "selinuxfs" | "efivarfs" | "hugetlbfs" | "fusectl" | "fuse.gvfsd-fuse" |
                     "overlay" | "squashfs" | "iso9660" | "udf") {
                     self.emit_alert(&format!("mount_unexpected_{}", mount_point.replace('/', "_")),
-                        AlertSeverity::Warning, json!({
+                        AlertSeverity::Info, json!({
                             "alert_type": MountAlertType::MountUnexpected.as_str(),
                             "metric": "mount_unexpected",
                             "mount_point": mount_point,
