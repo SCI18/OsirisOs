@@ -41,8 +41,37 @@
 
 ---
 
+### Kha & kha-watchd Architecture Rationale
+
+**Kha (PID 1) — No IPC Surface**
+- Per `kha.md` and `kha/src/main.rs:7-10`: "Kha deliberately has NO Ma'at/IPC surface. It does not register with itself, does not speak DaemonMessage/BridgeMessage. The only channel into this process is OS signals."
+- Kha is PID 1 — kernel parent of all processes. Its sole job: mount essentials, spawn Bridge, reap zombies, forward signals, stay alive.
+- No Ma'at registration, no IPC socket, no HTTP surface. Pure signal-driven.
+
+**kha-watchd — Passive External Monitor**
+- Not a child of Kha. Registers with Bridge like any other SystemCore daemon.
+- Monitors Kha **passively** via kernel interfaces:
+  - `kill(1, 0)` — liveness via signal 0
+  - `/proc/1/stat` field 2 — process state (Z/D/T)
+  - `/proc/1/stat` field 21 (starttime) + `/proc/uptime` — uptime
+  - `/proc/*/stat` scan for `state='Z' && ppid=1` — zombie children
+- **Does NOT receive signals from Kha** — Kha only forwards SIGTERM/SIGINT to Bridge (its direct child)
+- `kha/src/main.rs:157-163` explicitly leaves restart policy as open TODO for Systems Spec
+- Signal forwarding stats marked ⚠️ LIMITED in audit because true reaping delta requires Kha to expose via Ma'at — architectural choice, not a bug
+
+**Supervision Hierarchy (Clean Separation):**
+```
+Kernel → Kha (PID 1) → AkerNet Bridge → 42 daemons (including kha-watchd)
+                ↓
+           reap zombies, forward signals
+                ↑
+           kha-watchd (passive observer via /proc)
+```
+No circular supervision. Kha supervises Bridge; kha-watchd observes Kha passively.
+
 ---
-### Build Status
+
+### All Critical Gaps Resolved
 ```
 cargo build --workspace
 Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.79s
