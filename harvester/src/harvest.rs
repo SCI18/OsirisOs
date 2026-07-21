@@ -1,17 +1,20 @@
 // Harvester — harvest.rs
 // Extracts packages from Debian proot into .osr format.
-// Your original recursive ldd logic preserved and upgraded.
+// Recursive ldd logic preserved and upgraded.
 
 use std::fs;
 use std::process::Command;
 use std::path::PathBuf;
 use crate::config::{OsirisConfig, detect_arch};
+use crate::install::validate_package_name;
+use crate::manifest::{Manifest, PackageSource};
 
 pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
+    validate_package_name(name)?;
+
     let debian_root = &cfg.debian_root;
 
-    // Locate binary in Debian proot
-    let bin_path     = debian_root.join("usr/bin").join(name);
+    let bin_path = debian_root.join("usr/bin").join(name);
     let alt_bin_path = debian_root.join("bin").join(name);
 
     let actual_bin = if bin_path.exists() {
@@ -28,30 +31,37 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
 
     println!("[harvester] Found: {}", actual_bin.display());
 
-    // Collect all dependencies — recursive ldd + dpkg cross-check
-    let mut deps = get_all_deps(actual_bin.to_str().unwrap(), cfg);
-    let dpkg_deps = get_dpkg_deps(name);
-    deps.extend(dpkg_deps);
-    deps.dedup();
+    // NOTE (security, flagged not fixed this pass): ldd's implementation on
+    // many systems resolves dependencies by actually executing the target
+    // binary via a special dynamic-loader environment variable. Running
+    // ldd on an untrusted binary can execute arbitrary code. This is an
+    // accepted risk today because harvest only ever targets binaries from
+    // the trusted local Debian proot — do not point this at
+    // user-downloaded or otherwise untrusted binaries without switching to
+    // a safer static analysis method (e.g. `readelf -d` NEEDED entries).
+    let mut lib_deps = get_lib_deps(actual_bin.to_str().unwrap(), cfg);
 
-    println!("[harvester] Dependencies found: {}", deps.len());
+    // FIX (dict3.md #3): the previous version of this function queried
+    // `dpkg -L <name>` (files belonging to the package) and filtered for
+    // .so files — that returns the package's own shipped libraries, not
+    // its dependencies. This queries the actual dependency field instead.
+    let package_deps = get_package_deps(name);
 
-    // Build staging directory
-    let staging = PathBuf::from(format!("/tmp/harvester-staging-{}", name));
-    fs::create_dir_all(staging.join("usr/bin"))
-        .map_err(|e| e.to_string())?;
+    println!("[harvester] Library dependencies found: {}", lib_deps.len());
+    println!("[harvester] Package dependencies found: {}", package_deps.len());
+
+    let staging = std::env::temp_dir().join(format!("harvester-staging-{}", name));
+    fs::create_dir_all(staging.join("usr/bin")).map_err(|e| e.to_string())?;
     fs::create_dir_all(staging.join("usr/lib").join(format!("{}-linux-gnu", detect_arch())))
         .map_err(|e| e.to_string())?;
-    fs::create_dir_all(staging.join("lib"))
-        .map_err(|e| e.to_string())?;
+    fs::create_dir_all(staging.join("lib")).map_err(|e| e.to_string())?;
 
-    // Copy binary into staging
     fs::copy(&actual_bin, staging.join("usr/bin").join(name))
         .map_err(|e| format!("Could not copy binary: {}", e))?;
     println!("[harvester] Copied binary: {}", name);
 
-    // Copy each dependency into staging
-    for dep in &deps {
+    lib_deps.dedup();
+    for dep in &lib_deps {
         let libname = dep.split('/').last().unwrap_or(dep);
         if let Some(src) = find_lib(libname, cfg) {
             let dst = if libname.starts_with("ld-linux") {
@@ -62,7 +72,7 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
                     .join(libname)
             };
             match fs::copy(&src, &dst) {
-                Ok(_)  => println!("[harvester]   + {}", libname),
+                Ok(_) => println!("[harvester]   + {}", libname),
                 Err(e) => println!("[harvester]   ! {} (copy failed: {})", libname, e),
             }
         } else {
@@ -70,21 +80,21 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
         }
     }
 
-    // Write manifest into staging
-    let manifest = format!(
-        "[package]\nname = \"{}\"\nversion = \"harvested\"\narch = \"{}\"\nsource = \"harvester\"\n",
-        name,
-        detect_arch()
-    );
-    fs::write(staging.join("manifest.toml"), manifest)
+    // FIX (dict3.md #4): build a real Manifest and serialize it via
+    // to_toml(), instead of a hand-written format!() string that only ever
+    // covered 4 fields and could silently drift from manifest.rs's actual
+    // struct shape.
+    let mut manifest = Manifest::new_with_source(name, "harvested", PackageSource::Harvester);
+    if !package_deps.is_empty() {
+        manifest.package.depends = Some(package_deps);
+    }
+    fs::write(staging.join("manifest.toml"), manifest.to_toml())
         .map_err(|e| format!("Could not write manifest: {}", e))?;
 
-    // Pack staging into .osr (tar.gz under the hood, .osr extension)
-    fs::create_dir_all(&cfg.pkg_cache)
-        .map_err(|e| e.to_string())?;
+    fs::create_dir_all(&cfg.pkg_cache).map_err(|e| e.to_string())?;
 
     let osr_path = cfg.pkg_cache.join(format!("{}.osr", name));
-    let osr_str  = osr_path.to_str().ok_or("Invalid cache path")?;
+    let osr_str = osr_path.to_str().ok_or("Invalid cache path")?;
     let staging_str = staging.to_str().ok_or("Invalid staging path")?;
 
     let status = Command::new("tar")
@@ -96,19 +106,20 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
         return Err(format!("Failed to pack .osr for {}", name));
     }
 
-    // Clean up staging directory
     let _ = fs::remove_dir_all(&staging);
 
     println!("[harvester] Package ready: {}", osr_path.display());
     Ok(())
 }
 
-/// Recursively collect all shared library dependencies via ldd
-/// Original algorithm preserved — cycle detection via checked list
-fn get_all_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
+/// Recursively collect all shared library dependencies via ldd.
+/// Renamed from get_all_deps to get_lib_deps for clarity, now that
+/// get_package_deps exists as a genuinely distinct concept (package names,
+/// not library filenames).
+fn get_lib_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
     let mut all_deps: Vec<String> = Vec::new();
     let mut to_check: Vec<String> = vec![binary.to_string()];
-    let mut checked:  Vec<String> = Vec::new();
+    let mut checked: Vec<String> = Vec::new();
 
     while !to_check.is_empty() {
         let current = to_check.remove(0);
@@ -118,9 +129,7 @@ fn get_all_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
         }
         checked.push(current.clone());
 
-        let output = Command::new("ldd")
-            .arg(&current)
-            .output();
+        let output = Command::new("ldd").arg(&current).output();
 
         if let Ok(o) = output {
             let stdout = String::from_utf8_lossy(&o.stdout);
@@ -137,14 +146,10 @@ fn get_all_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
 
                 if let Some(path) = lib_path {
                     if path.starts_with('/') && !path.contains("not found") {
-                        let libname = path.split('/')
-                            .last()
-                            .unwrap_or("")
-                            .to_string();
+                        let libname = path.split('/').last().unwrap_or("").to_string();
 
                         if !libname.is_empty() && !all_deps.contains(&libname) {
                             all_deps.push(libname.clone());
-                            // Recurse into this lib's dependencies
                             if let Some(found) = find_lib(&libname, cfg) {
                                 if !checked.contains(&found) {
                                     to_check.push(found);
@@ -160,26 +165,44 @@ fn get_all_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
     all_deps
 }
 
-/// Cross-check dependencies via dpkg -L for completeness
-fn get_dpkg_deps(name: &str) -> Vec<String> {
-    let output = Command::new("dpkg")
-        .args(&["-L", name])
+/// FIX (dict3.md #3): queries the package's actual declared dependencies
+/// (other package names) via dpkg's status database, not its file list.
+/// Uses `dpkg-query -W -f='${Depends}'` and strips version-constraint
+/// syntax (e.g. "libc6 (>= 2.34)" -> "libc6") and alternative-package
+/// syntax (e.g. "libfoo | libbar" -> takes libfoo) to produce a clean list
+/// of bare package names suitable for the manifest's `depends` field.
+fn get_package_deps(name: &str) -> Vec<String> {
+    let output = Command::new("dpkg-query")
+        .args(&["-W", "-f=${Depends}", name])
         .output();
 
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| l.contains(".so"))
-            .map(|l| l.trim().to_string())
-            .collect(),
-        Err(_) => vec![],
-    }
+    let raw = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return vec![],
+    };
+
+    raw.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            // Take the first alternative in "a | b" syntax.
+            let first_alt = entry.split('|').next().unwrap_or(entry).trim();
+            // Strip "(>= 2.34)"-style version constraints.
+            let name_only = first_alt.split_whitespace().next().unwrap_or(first_alt);
+            if name_only.is_empty() {
+                None
+            } else {
+                Some(name_only.to_string())
+            }
+        })
+        .collect()
 }
 
-/// Search for a library in known Debian proot locations
 fn find_lib(name: &str, cfg: &OsirisConfig) -> Option<String> {
     let debian_root = &cfg.debian_root;
-    let arch        = detect_arch();
+    let arch = detect_arch();
 
     let search_paths = vec![
         debian_root.join("lib").join(format!("{}-linux-gnu", arch)).join(name),

@@ -8,6 +8,7 @@
 mod config;
 mod harvest;
 mod install;
+mod manifest;
 mod remove;
 
 use std::env;
