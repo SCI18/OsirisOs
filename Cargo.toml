@@ -18,6 +18,12 @@ members = [
     "daemons/system_core/mountd",
     "daemons/system_core/entropyd",
     "daemons/system_core/kha-watchd",
+    "daemons/network_akernet/netd",
+    "daemons/network_akernet/wifid",
+    "daemons/network_akernet/dnsd",
+    "daemons/network_akernet/vpnd",
+    "daemons/network_akernet/firewalld",
+    "daemons/network_akernet/proxyd",
 ]
 
 # Shared dependencies across all workspace members

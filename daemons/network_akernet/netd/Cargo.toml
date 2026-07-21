@@ -1,0 +1,21 @@
+[package]
+name        = "netd"
+version     = "0.1.0-alpha"
+edition     = "2021"
+description = "Daemon #22 — Core network management, interfaces"
+authors     = ["droidmaster"]
+
+[[bin]]
+name = "netd"
+path = "src/main.rs"
+
+[dependencies]
+maat       = { path = "../../../maat" }
+tokio      = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono     = { workspace = true }
