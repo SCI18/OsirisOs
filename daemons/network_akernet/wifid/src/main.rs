@@ -2,6 +2,7 @@
 // WiFi scanning, connection, profiles
 // "The air is scanned. The signal is known."
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,11 +27,32 @@ enum ReaderEvent {
     Closed,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WifiNetwork {
+    ssid: String,
+    bssid: String,
+    frequency: u32,
+    signal_dbm: i32,
+    flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WifiInterface {
+    name: String,
+    connected: bool,
+    current_ssid: Option<String>,
+    current_bssid: Option<String>,
+    signal_dbm: Option<i32>,
+    bitrate_mbps: Option<u32>,
+    known_networks: Vec<WifiNetwork>,
+}
+
 struct Wifid {
     socket_write_half: Arc<Mutex<Option<tokio::net::unix::OwnedWriteHalf>>>,
     daemon_name: String,
     pid: u32,
-    last_alerts: Arc<Mutex<std::collections::HashMap<String, (AlertSeverity, u64)>>>,
+    last_alerts: Arc<Mutex<HashMap<String, (AlertSeverity, u64)>>>,
+    known_interfaces: Arc<Mutex<HashMap<String, WifiInterface>>>,
 }
 
 impl Wifid {
@@ -39,7 +61,8 @@ impl Wifid {
             socket_write_half: Arc::new(Mutex::new(None)),
             daemon_name: "wifid".to_string(),
             pid: std::process::id(),
-            last_alerts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            last_alerts: Arc::new(Mutex::new(HashMap::new())),
+            known_interfaces: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -179,13 +202,201 @@ impl Wifid {
         Ok(())
     }
 
+    /// Read WiFi interface info from /proc/net/wireless
+    async fn read_proc_net_wireless(&self) -> HashMap<String, WifiInterface> {
+        let mut interfaces = HashMap::new();
+        
+        if let Ok(content) = tokio::fs::read_to_string("/proc/net/wireless").await {
+            for line in content.lines().skip(2) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 10 {
+                    continue;
+                }
+                
+                let name = parts[0].trim_end_matches(':').to_string();
+                if name == "lo" {
+                    continue;
+                }
+                
+                let status = parts[1].parse::<u32>().unwrap_or(0);
+                let link_quality = parts[2].parse::<u32>().unwrap_or(0);
+                let signal_level = parts[3].parse::<i32>().unwrap_or(0);
+                let noise_level = parts[4].parse::<i32>().unwrap_or(0);
+                
+                // Calculate approximate signal in dBm (signal_level is typically in dBm * -1)
+                let signal_dbm = if signal_level < 0 { signal_level } else { -signal_level };
+                
+                let mut iface = WifiInterface {
+                    name: name.clone(),
+                    connected: status & 0x1 != 0, // IEEE80211_CONNECTED
+                    signal_dbm: Some(signal_dbm),
+                    bitrate_mbps: None,
+                    known_networks: Vec::new(),
+                    current_ssid: None,
+                    current_bssid: None,
+                };
+                
+                // Try to get current connection info from /sys/class/net/<iface>/wireless
+                if let Ok(conn_content) = tokio::fs::read_to_string(format!("/sys/class/net/{}/wireless", name)).await {
+                    for line in conn_content.lines() {
+                        if let Some(ssid) = line.strip_prefix("ssid=") {
+                            iface.current_ssid = Some(ssid.to_string());
+                        } else if let Some(bssid) = line.strip_prefix("bssid=") {
+                            iface.current_bssid = Some(bssid.to_string());
+                        }
+                    }
+                }
+                
+                interfaces.insert(name, iface);
+            }
+        }
+        
+        interfaces
+    }
+
+    /// Scan for available networks using iw command (if available)
+    async fn scan_networks(&self, iface: &str) -> Vec<WifiNetwork> {
+        let mut networks = Vec::new();
+        
+        if let Ok(output) = tokio::process::Command::new("iw")
+            .args(["dev", iface, "scan"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut current: Option<WifiNetwork> = None;
+                
+                for line in stdout.lines() {
+                    let line = line.trim();
+                    if line.starts_with("BSS ") {
+                        if let Some(n) = current.take() {
+                            networks.push(n);
+                        }
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        current = Some(WifiNetwork {
+                            bssid: parts.get(1).unwrap_or(&"").to_string(),
+                            ..Default::default()
+                        });
+                    } else if let Some(ref mut n) = current {
+                        if let Some(ssid) = line.strip_prefix("SSID: ") {
+                            n.ssid = ssid.to_string();
+                        } else if let Some(freq) = line.strip_prefix("freq: ") {
+                            n.frequency = freq.parse().unwrap_or(0);
+                        } else if let Some(signal) = line.strip_prefix("signal: ") {
+                            n.signal_dbm = signal.split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                        } else if line.contains("capability:") {
+                            n.flags.push(line.to_string());
+                        }
+                    }
+                }
+                if let Some(n) = current {
+                    networks.push(n);
+                }
+            }
+        }
+        
+        networks
+    }
+
     async fn collect_and_check(&self) -> Result<()> {
-        // TODO: Implement WiFi monitoring
-        // - Scan for available networks via nl80211 / iw
-        // - Track connection state (associated, disconnected, roaming)
-        // - Monitor signal strength, SNR, bitrate
-        // - Alert on connection loss, auth failures, roaming issues
-        // - Manage known network profiles
+        let current_wireless = self.read_proc_net_wireless().await;
+        let mut known = self.known_interfaces.lock().await;
+
+        // Collect keys to avoid borrowing issues
+        let current_names: Vec<String> = current_wireless.keys().cloned().collect();
+        
+        for name in current_names {
+            let mut current = current_wireless.get(&name).unwrap().clone();
+            
+            // Scan for available networks (expensive, do less frequently)
+            let networks = self.scan_networks(&name).await;
+            current.known_networks = networks;
+
+            if !known.contains_key(&name) {
+                // New WiFi interface
+                self.emit_alert(&format!("wifi_interface_new_{}", name), AlertSeverity::Info, serde_json::json!({
+                    "alert_type": "WiFiInterfaceAppeared",
+                    "interface": name,
+                    "connected": current.connected,
+                    "signal_dbm": current.signal_dbm,
+                    "message": format!("New WiFi interface detected: {}", name),
+                })).await?;
+            } else {
+                let previous = &known[&name];
+                
+                // Check connection state change
+                if previous.connected != current.connected {
+                    let severity = if current.connected { AlertSeverity::Info } else { AlertSeverity::Warning };
+                    self.emit_alert(&format!("wifi_connection_change_{}", name), severity, serde_json::json!({
+                        "alert_type": "WiFiConnectionChange",
+                        "interface": name,
+                        "connected": current.connected,
+                        "ssid": current.current_ssid,
+                        "bssid": current.current_bssid,
+                        "message": format!("WiFi interface {} {}", name, if current.connected { "connected" } else { "disconnected" }),
+                    })).await?;
+                }
+
+                // Check signal strength degradation
+                if let (Some(prev_sig), Some(curr_sig)) = (previous.signal_dbm, current.signal_dbm) {
+                    if prev_sig - curr_sig > 10 { // Signal dropped by more than 10 dBm
+                        self.emit_alert(&format!("wifi_signal_drop_{}", name), AlertSeverity::Warning, serde_json::json!({
+                            "alert_type": "WiFiSignalDegraded",
+                            "interface": name,
+                            "previous_signal_dbm": prev_sig,
+                            "current_signal_dbm": curr_sig,
+                            "drop_dbm": prev_sig - curr_sig,
+                            "message": format!("WiFi signal degraded on {}: {} dBm drop", name, prev_sig - curr_sig),
+                        })).await?;
+                    }
+                }
+
+                // Check for roaming (BSSID change while connected)
+                if current.connected && previous.current_bssid != current.current_bssid {
+                    if let (Some(prev), Some(curr)) = (&previous.current_bssid, &current.current_bssid) {
+                        if prev != curr {
+                            self.emit_alert(&format!("wifi_roam_{}", name), AlertSeverity::Info, serde_json::json!({
+                                "alert_type": "WiFiRoam",
+                                "interface": name,
+                                "previous_bssid": prev,
+                                "current_bssid": curr,
+                                "ssid": current.current_ssid,
+                                "message": format!("WiFi roamed on {}: {} -> {}", name, prev, curr),
+                            })).await?;
+                        }
+                    }
+                }
+
+                // Check for authentication failures (disconnected with no clean roam)
+                if previous.connected && !current.connected && previous.current_bssid == current.current_bssid {
+                    self.emit_alert(&format!("wifi_auth_fail_{}", name), AlertSeverity::Warning, serde_json::json!({
+                        "alert_type": "WiFiAuthFailure",
+                        "interface": name,
+                        "ssid": previous.current_ssid,
+                        "bssid": previous.current_bssid,
+                        "message": format!("WiFi authentication failure or link loss on {}", name),
+                    })).await?;
+                }
+            }
+
+            known.insert(name.clone(), current.clone());
+        }
+
+        // Check for disappeared WiFi interfaces
+        let current_names: std::collections::HashSet<_> = current_wireless.keys().cloned().collect();
+        let known_names: Vec<String> = known.keys().cloned().collect();
+        for name in known_names {
+            if !current_names.contains(&name) {
+                self.emit_alert(&format!("wifi_interface_gone_{}", name), AlertSeverity::Warning, serde_json::json!({
+                    "alert_type": "WiFiInterfaceDisappeared",
+                    "interface": name,
+                    "message": format!("WiFi interface {} disappeared", name),
+                })).await?;
+            }
+        }
+
+        *known = current_wireless.clone();
 
         let status = DaemonMessage::StatusUpdate {
             name: self.daemon_name.clone(),

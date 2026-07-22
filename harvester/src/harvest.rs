@@ -1,13 +1,11 @@
 // Harvester — harvest.rs
 // Extracts packages from Debian proot into .osr format.
-// Recursive ldd logic preserved and upgraded.
 
 use std::fs;
 use std::process::Command;
-use std::path::PathBuf;
 use crate::config::{OsirisConfig, detect_arch};
 use crate::install::validate_package_name;
-use crate::manifest::{Manifest, PackageSource};
+use crate::manifest::{Manifest, PackageSource, FileList, FileEntry, compute_checksum};
 
 pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
     validate_package_name(name)?;
@@ -31,48 +29,61 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
 
     println!("[harvester] Found: {}", actual_bin.display());
 
-    // NOTE (security, flagged not fixed this pass): ldd's implementation on
-    // many systems resolves dependencies by actually executing the target
-    // binary via a special dynamic-loader environment variable. Running
-    // ldd on an untrusted binary can execute arbitrary code. This is an
-    // accepted risk today because harvest only ever targets binaries from
-    // the trusted local Debian proot — do not point this at
-    // user-downloaded or otherwise untrusted binaries without switching to
-    // a safer static analysis method (e.g. `readelf -d` NEEDED entries).
+    // NOTE (security, flagged not fixed): ldd can execute the target
+    // binary via dynamic-loader env tricks on some systems. Accepted risk
+    // today since harvest only targets trusted local Debian proot binaries
+    // — do not point this at untrusted binaries without switching to
+    // static analysis (e.g. `readelf -d` NEEDED entries) first.
     let mut lib_deps = get_lib_deps(actual_bin.to_str().unwrap(), cfg);
-
-    // FIX (dict3.md #3): the previous version of this function queried
-    // `dpkg -L <name>` (files belonging to the package) and filtered for
-    // .so files — that returns the package's own shipped libraries, not
-    // its dependencies. This queries the actual dependency field instead.
     let package_deps = get_package_deps(name);
 
     println!("[harvester] Library dependencies found: {}", lib_deps.len());
     println!("[harvester] Package dependencies found: {}", package_deps.len());
 
     let staging = std::env::temp_dir().join(format!("harvester-staging-{}", name));
-    fs::create_dir_all(staging.join("usr/bin")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(staging.join("usr/lib").join(format!("{}-linux-gnu", detect_arch())))
-        .map_err(|e| e.to_string())?;
-    fs::create_dir_all(staging.join("lib")).map_err(|e| e.to_string())?;
+    let bin_dir = staging.join("usr/bin");
+    let lib_dir = staging.join("usr/lib").join(format!("{}-linux-gnu", detect_arch()));
+    let ld_dir = staging.join("lib");
 
-    fs::copy(&actual_bin, staging.join("usr/bin").join(name))
+    fs::create_dir_all(&bin_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&lib_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&ld_dir).map_err(|e| e.to_string())?;
+
+    let bin_dst = bin_dir.join(name);
+    fs::copy(&actual_bin, &bin_dst)
         .map_err(|e| format!("Could not copy binary: {}", e))?;
     println!("[harvester] Copied binary: {}", name);
 
+    // FIX: checksum computed for every file actually placed in staging,
+    // and its path recorded relative to osiris_root (i.e. "usr/bin/<name>",
+    // not an absolute staging path) — this is the path install.rs will
+    // check the file against after the package is eventually installed.
+    let bin_checksum = compute_checksum(&bin_dst).ok();
+    let mut bin_entries = vec![FileEntry {
+        path: format!("usr/bin/{}", name),
+        checksum: bin_checksum,
+    }];
+
     lib_deps.dedup();
+    let mut lib_entries: Vec<FileEntry> = Vec::new();
+
     for dep in &lib_deps {
         let libname = dep.split('/').last().unwrap_or(dep);
         if let Some(src) = find_lib(libname, cfg) {
-            let dst = if libname.starts_with("ld-linux") {
-                staging.join("lib").join(libname)
+            let (dst, rel_path) = if libname.starts_with("ld-linux") {
+                (ld_dir.join(libname), format!("lib/{}", libname))
             } else {
-                staging.join("usr/lib")
-                    .join(format!("{}-linux-gnu", detect_arch()))
-                    .join(libname)
+                (
+                    lib_dir.join(libname),
+                    format!("usr/lib/{}-linux-gnu/{}", detect_arch(), libname),
+                )
             };
             match fs::copy(&src, &dst) {
-                Ok(_) => println!("[harvester]   + {}", libname),
+                Ok(_) => {
+                    println!("[harvester]   + {}", libname);
+                    let checksum = compute_checksum(&dst).ok();
+                    lib_entries.push(FileEntry { path: rel_path, checksum });
+                }
                 Err(e) => println!("[harvester]   ! {} (copy failed: {})", libname, e),
             }
         } else {
@@ -80,14 +91,27 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
         }
     }
 
-    // FIX (dict3.md #4): build a real Manifest and serialize it via
-    // to_toml(), instead of a hand-written format!() string that only ever
-    // covered 4 fields and could silently drift from manifest.rs's actual
-    // struct shape.
+    // bin_entries currently holds only the main binary; if in future
+    // multiple binaries are harvested per package, extend this vec rather
+    // than reassigning.
+    let _ = &mut bin_entries;
+
     let mut manifest = Manifest::new_with_source(name, "harvested", PackageSource::Harvester);
     if !package_deps.is_empty() {
         manifest.package.depends = Some(package_deps);
     }
+    manifest.files = Some(FileList {
+        bin: Some(bin_entries),
+        lib: if lib_entries.is_empty() { None } else { Some(lib_entries) },
+        share: None,
+        etc: None,
+    });
+    // Scripts intentionally left None here — harvest.rs harvests an
+    // existing Debian-proot binary, which has no natural pre/post-install
+    // hook source. Scripts are populated by whatever authors a package
+    // directly (e.g. a future `harvester package` command for
+    // hand-authored .osr packages), not by the harvest-from-proot path.
+
     fs::write(staging.join("manifest.toml"), manifest.to_toml())
         .map_err(|e| format!("Could not write manifest: {}", e))?;
 
@@ -108,14 +132,10 @@ pub fn harvest(name: &str, cfg: &OsirisConfig) -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&staging);
 
-    println!("[harvester] Package ready: {}", osr_path.display());
+    println!("[harvester] Package ready: {} (checksums recorded)", osr_path.display());
     Ok(())
 }
 
-/// Recursively collect all shared library dependencies via ldd.
-/// Renamed from get_all_deps to get_lib_deps for clarity, now that
-/// get_package_deps exists as a genuinely distinct concept (package names,
-/// not library filenames).
 fn get_lib_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
     let mut all_deps: Vec<String> = Vec::new();
     let mut to_check: Vec<String> = vec![binary.to_string()];
@@ -123,7 +143,6 @@ fn get_lib_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
 
     while !to_check.is_empty() {
         let current = to_check.remove(0);
-
         if checked.contains(&current) {
             continue;
         }
@@ -147,7 +166,6 @@ fn get_lib_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
                 if let Some(path) = lib_path {
                     if path.starts_with('/') && !path.contains("not found") {
                         let libname = path.split('/').last().unwrap_or("").to_string();
-
                         if !libname.is_empty() && !all_deps.contains(&libname) {
                             all_deps.push(libname.clone());
                             if let Some(found) = find_lib(&libname, cfg) {
@@ -165,12 +183,9 @@ fn get_lib_deps(binary: &str, cfg: &OsirisConfig) -> Vec<String> {
     all_deps
 }
 
-/// FIX (dict3.md #3): queries the package's actual declared dependencies
-/// (other package names) via dpkg's status database, not its file list.
-/// Uses `dpkg-query -W -f='${Depends}'` and strips version-constraint
-/// syntax (e.g. "libc6 (>= 2.34)" -> "libc6") and alternative-package
-/// syntax (e.g. "libfoo | libbar" -> takes libfoo) to produce a clean list
-/// of bare package names suitable for the manifest's `depends` field.
+/// Queries actual package dependencies via dpkg's status database, not its
+/// file list. Strips version constraints and takes the first alternative
+/// in "a | b" syntax.
 fn get_package_deps(name: &str) -> Vec<String> {
     let output = Command::new("dpkg-query")
         .args(&["-W", "-f=${Depends}", name])
@@ -187,15 +202,9 @@ fn get_package_deps(name: &str) -> Vec<String> {
             if entry.is_empty() {
                 return None;
             }
-            // Take the first alternative in "a | b" syntax.
             let first_alt = entry.split('|').next().unwrap_or(entry).trim();
-            // Strip "(>= 2.34)"-style version constraints.
             let name_only = first_alt.split_whitespace().next().unwrap_or(first_alt);
-            if name_only.is_empty() {
-                None
-            } else {
-                Some(name_only.to_string())
-            }
+            if name_only.is_empty() { None } else { Some(name_only.to_string()) }
         })
         .collect()
 }

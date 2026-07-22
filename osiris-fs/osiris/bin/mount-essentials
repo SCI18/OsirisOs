@@ -1,0 +1,96 @@
+#!/bin/sh
+# /osiris/bin/mount-essentials - Mount essential filesystems for Osiris OS
+# Called by Kha (PID 1) at early boot before Bridge spawn
+# Runs in initramfs context; /osiris not yet mounted
+
+set -eu
+
+OSIRIS_ROOT="${OSIRIS_ROOT:-/osiris}"
+OSIRIS_ROOT_PARTUUID="${OSIRIS_ROOT_PARTUUID:-}"
+OSIRIS_VAR_PARTUUID="${OSIRIS_VAR_PARTUUID:-}"
+OSIRIS_HOME_PARTUUID="${OSIRIS_HOME_PARTUUID:-}"
+OSIRIS_OPT_PARTUUID="${OSIRIS_OPT_PARTUUID:-}"
+OSIRIS_BOOT_PARTUUID="${OSIRIS_BOOT_PARTUUID:-}"
+
+log() {
+    echo "[mount-essentials] $*" >&2
+}
+
+mount_or_warn() {
+    local src="$1"
+    local dst="$2"
+    local fstype="$3"
+    local opts="${4:-defaults}"
+
+    mkdir -p "$dst"
+    if mount -t "$fstype" -o "$opts" "$src" "$dst" 2>/dev/null; then
+        log "Mounted $src ($fstype) at $dst"
+        return 0
+    else
+        log "WARN: Failed to mount $src at $dst (may already be mounted or unavailable)"
+        return 1
+    fi
+}
+
+# Virtual filesystems (kernel-provided)
+log "Mounting virtual filesystems..."
+mount_or_warn "proc"   "/proc"   "proc"   "nosuid,noexec,nodev"
+mount_or_warn "sysfs"  "/sys"    "sysfs"  "nosuid,noexec,nodev"
+mount_or_warn "devtmpfs" "/dev"  "devtmpfs" "mode=0755,nosuid"
+mount_or_warn "tmpfs"  "/run"    "tmpfs"  "mode=0755,nosuid,nodev,size=10%"
+
+# Osiris root filesystem (read-only package store)
+if [ -n "$OSIRIS_ROOT_PARTUUID" ]; then
+    log "Mounting Osiris root from PARTUUID=$OSIRIS_ROOT_PARTUUID..."
+    mkdir -p "$OSIRIS_ROOT"
+    if mount -t ext4 -o "defaults,noatime,ro" "PARTUUID=$OSIRIS_ROOT_PARTUUID" "$OSIRIS_ROOT"; then
+        log "Osiris root mounted at $OSIRIS_ROOT"
+    else
+        log "ERROR: Failed to mount Osiris root - cannot continue"
+        exit 1
+    fi
+else
+    log "ERROR: OSIRIS_ROOT_PARTUUID not set"
+    exit 1
+fi
+
+# Bind-mount /run to /osiris/run for Bridge socket
+mkdir -p "$OSIRIS_ROOT/run"
+mount --bind /run "$OSIRIS_ROOT/run"
+
+# Var partition (mutable state)
+if [ -n "$OSIRIS_VAR_PARTUUID" ]; then
+    log "Mounting /osiris/var from PARTUUID=$OSIRIS_VAR_PARTUUID..."
+    mkdir -p "$OSIRIS_ROOT/var"
+    mount_or_warn "PARTUUID=$OSIRIS_VAR_PARTUUID" "$OSIRIS_ROOT/var" "ext4" "defaults,noatime"
+fi
+
+# Home partition
+if [ -n "$OSIRIS_HOME_PARTUUID" ]; then
+    log "Mounting /osiris/home from PARTUUID=$OSIRIS_HOME_PARTUUID..."
+    mkdir -p "$OSIRIS_ROOT/home"
+    mount_or_warn "PARTUUID=$OSIRIS_HOME_PARTUUID" "$OSIRIS_ROOT/home" "ext4" "defaults,noatime,nodev,nosuid"
+fi
+
+# Opt partition (optional)
+if [ -n "$OSIRIS_OPT_PARTUUID" ]; then
+    log "Mounting /osiris/opt from PARTUUID=$OSIRIS_OPT_PARTUUID..."
+    mkdir -p "$OSIRIS_ROOT/opt"
+    mount_or_warn "PARTUUID=$OSIRIS_OPT_PARTUUID" "$OSIRIS_ROOT/opt" "ext4" "defaults,noatime,nodev"
+fi
+
+# Boot partition (for kernel/initramfs updates)
+if [ -n "$OSIRIS_BOOT_PARTUUID" ]; then
+    log "Mounting /boot from PARTUUID=$OSIRIS_BOOT_PARTUUID..."
+    mkdir -p /boot
+    mount_or_warn "PARTUUID=$OSIRIS_BOOT_PARTUUID" "/boot" "vfat" "defaults,noatime"
+fi
+
+# Remount /etc/osiris from /osiris/etc if exists (mutable config overlay)
+if [ -d "$OSIRIS_ROOT/etc" ]; then
+    mkdir -p /etc/osiris
+    mount --bind "$OSIRIS_ROOT/etc" /etc/osiris
+fi
+
+log "Essential mounts complete"
+exit 0

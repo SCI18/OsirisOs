@@ -1,15 +1,11 @@
 // Harvester — Osiris Package Workhorse
 // dpkg equivalent + APK bridge
-// "The reaper takes what is needed and installs it cleanly."
-//
-// OPIUM calls Harvester. Users can also call Harvester directly (Netjeru).
-// Ramesses users never see this — OPIUM handles everything for them.
 
 mod config;
 mod harvest;
 mod install;
-mod manifest;
 mod remove;
+mod manifest;
 
 use std::env;
 use config::OsirisConfig;
@@ -19,15 +15,18 @@ const VERSION: &str = "0.2.0-alpha";
 fn print_help() {
     println!("Harvester — Osiris Package Workhorse");
     println!("Version {}\n", VERSION);
-    println!("Usage: harvester <command> [package]\n");
+    println!("Usage: harvester <command> [package] [flags]\n");
     println!("Commands:");
-    println!("  harvest  <pkg>    Extract package from Debian proot → .osr");
-    println!("  install  <pkg>    Install a .osr package directly");
-    println!("  remove   <pkg>    Remove an installed package");
-    println!("  list              List installed packages");
-    println!("  env               Show detected Osiris environment");
-    println!("  help              Show this help\n");
-    println!("Note: For dependency resolution and repo management, use OPIUM.");
+    println!("  harvest  <pkg>          Extract package from Debian proot → .osr");
+    println!("  install  <pkg> [--force] Install a .osr package directly");
+    println!("  remove   <pkg> [--purge] [--force]  Remove an installed package");
+    println!("  list                    List installed packages");
+    println!("  env                     Show detected Osiris environment");
+    println!("  help                    Show this help\n");
+    println!("Flags:");
+    println!("  --force   Override file-conflict / reverse-dependency checks");
+    println!("  --purge   (remove only) Also delete config files under etc/<pkg>/");
+    println!("\nNote: For dependency resolution and repo management, use OPIUM.");
 }
 
 fn main() {
@@ -46,6 +45,8 @@ fn main() {
 
     let command = &args[1];
     let package = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    let force = args.iter().any(|a| a == "--force");
+    let purge = args.iter().any(|a| a == "--purge");
 
     match command.as_str() {
         "harvest" => {
@@ -55,7 +56,7 @@ fn main() {
             }
             println!("[harvester] Harvesting {}...", package);
             match harvest::harvest(package, &cfg) {
-                Ok(_)  => println!(
+                Ok(_) => println!(
                     "[harvester] {} harvested successfully. Run: opium install {}",
                     package, package
                 ),
@@ -65,24 +66,24 @@ fn main() {
 
         "install" => {
             if package.is_empty() {
-                eprintln!("Usage: harvester install <package>");
+                eprintln!("Usage: harvester install <package> [--force]");
                 return;
             }
             println!("[harvester] Installing {}...", package);
-            match install::install(package, &cfg) {
-                Ok(_)  => println!("[harvester] {} installed", package),
+            match install::install(package, force, &cfg) {
+                Ok(_) => println!("[harvester] {} installed", package),
                 Err(e) => eprintln!("[harvester] Error: {}", e),
             }
         }
 
         "remove" => {
             if package.is_empty() {
-                eprintln!("Usage: harvester remove <package>");
+                eprintln!("Usage: harvester remove <package> [--purge] [--force]");
                 return;
             }
             println!("[harvester] Removing {}...", package);
-            match remove::remove(package, false, &cfg) {
-                Ok(_)  => println!("[harvester] {} removed", package),
+            match remove::remove(package, purge, force, &cfg) {
+                Ok(_) => println!("[harvester] {} removed", package),
                 Err(e) => eprintln!("[harvester] Error: {}", e),
             }
         }
