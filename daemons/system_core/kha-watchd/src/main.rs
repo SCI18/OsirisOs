@@ -9,7 +9,7 @@ use anyhow::Result;
 use chrono::DateTime;
 use maat::{DaemonMessage, BridgeMessage, Frame, DaemonStatus, AlertSeverity};
 use serde_json::{json, Value};
-use tokio::net::UnixStream;
+use tokio::net::{UnixStream, UnixDatagram};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Duration, interval};
@@ -21,16 +21,46 @@ const REGISTRATION_TIMEOUT_MS: u64 = 5000;
 const POLL_INTERVAL_MS: u64 = 10000; // 10 seconds
 const HEARTBEAT_LOG_INTERVAL_MS: u64 = 300_000; // 5 minutes, wall-clock
 const KHA_PID: i32 = 1;
+/// Kha metrics socket path (SOCK_DGRAM, one-way from Kha)
+const KHA_METRICS_SOCK: &str = "/run/osiris/kha-metrics.sock";
+/// Metrics frame size: 4 * u64 = 32 bytes
+const KHA_METRICS_FRAME_SIZE: usize = 32;
 /// If zombie children of Kha persist across this many consecutive polls,
 /// something is wrong with Kha's reaping loop — alert.
 const ZOMBIE_PERSIST_POLL_THRESHOLD: u32 = 3;
+
+/// Kha metrics frame (matching Kha's encode_metrics):
+/// u64 zombies_reaped
+/// u64 signals_forwarded
+/// u64 last_reap_ts
+/// u64 last_forward_ts
+#[derive(Debug, Clone, Default, PartialEq)]
+struct KhaMetrics {
+    zombies_reaped: u64,
+    signals_forwarded: u64,
+    last_reap_ts: u64,
+    last_forward_ts: u64,
+}
+
+impl KhaMetrics {
+    fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < KHA_METRICS_FRAME_SIZE {
+            return None;
+        }
+        Some(Self {
+            zombies_reaped: u64::from_le_bytes(buf[0..8].try_into().ok()?),
+            signals_forwarded: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+            last_reap_ts: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+            last_forward_ts: u64::from_le_bytes(buf[24..32].try_into().ok()?),
+        })
+    }
+}
 
 enum ReaderEvent {
     Bridge(BridgeMessage),
     Closed,
 }
 
-/// Kha process state, parsed from field 2 of /proc/1/stat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KhaState {
     Running,
@@ -78,6 +108,10 @@ struct KhaWatchd {
     kha_uptime_at_start: u64,
     /// Consecutive polls where a zombie child of Kha was observed.
     zombie_streak: Arc<Mutex<u32>>,
+    /// Kha metrics socket for reading reap/signal-forward stats
+    metrics_socket: Arc<Mutex<Option<UnixDatagram>>>,
+    /// Latest Kha metrics snapshot
+    latest_metrics: Arc<Mutex<KhaMetrics>>,
 }
 
 impl KhaWatchd {
@@ -91,6 +125,8 @@ impl KhaWatchd {
             last_alerts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             kha_uptime_at_start,
             zombie_streak: Arc::new(Mutex::new(0)),
+            metrics_socket: Arc::new(Mutex::new(None)),
+            latest_metrics: Arc::new(Mutex::new(KhaMetrics::default())),
         })
     }
 
@@ -290,6 +326,37 @@ impl KhaWatchd {
         Ok(())
     }
 
+    /// Connect to Kha's metrics SOCK_DGRAM socket for reap/signal-forward stats
+    async fn connect_kha_metrics(&self) -> Result<()> {
+        let sock = UnixDatagram::bind("0.0.0.0:0")?; // ephemeral port
+        sock.connect(KHA_METRICS_SOCK)?; // connect is sync, not async
+        *self.metrics_socket.lock().await = Some(sock);
+        info!("[kha-watchd] Connected to Kha metrics socket at {}", KHA_METRICS_SOCK);
+        Ok(())
+    }
+
+    /// Read latest metrics from Kha (non-blocking, returns immediately if no data)
+    async fn read_kha_metrics(&self) -> Option<KhaMetrics> {
+        let sock_guard = self.metrics_socket.lock().await;
+        if let Some(sock) = sock_guard.as_ref() {
+            let mut buf = [0u8; KHA_METRICS_FRAME_SIZE];
+            match sock.try_recv(&mut buf) {
+                Ok(n) if n == KHA_METRICS_FRAME_SIZE => {
+                    if let Some(metrics) = KhaMetrics::decode(&buf) {
+                        *self.latest_metrics.lock().await = metrics.clone();
+                        return Some(metrics);
+                    }
+                }
+                Ok(n) => debug!("[kha-watchd] Partial metrics frame received ({} bytes)", n),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // No data available - normal
+                }
+                Err(e) => debug!("[kha-watchd] Metrics read error: {}", e),
+            }
+        }
+        None
+    }
+
     async fn emit_alert(&self, alert_key: &str, severity: AlertSeverity, payload: Value) -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
@@ -332,6 +399,10 @@ impl KhaWatchd {
 
     /// Main check loop - monitors Kha health
     async fn check_kha(&self) -> Result<()> {
+        // Read Kha's metrics (reap count, signal forwarding)
+        let _ = self.read_kha_metrics().await;
+        let metrics = self.latest_metrics.lock().await.clone();
+
         let kha_alive = Self::is_kha_alive();
 
         if !kha_alive {
@@ -373,9 +444,20 @@ impl KhaWatchd {
                     "metric": "kha_zombie_children",
                     "zombie_count": zombie_count,
                     "consecutive_polls": *streak,
+                    "zombies_reaped_total": metrics.zombies_reaped,
                     "message": format!("{} zombie child(ren) of Kha have persisted for {} consecutive polls — reaping may be stalled", zombie_count, *streak),
                 })).await?;
             }
+        }
+
+        // Track signal forwarding stats from Kha
+        if metrics.signals_forwarded > 0 {
+            self.emit_alert("kha_signals_forwarded", AlertSeverity::Info, json!({
+                "metric": "kha_signals_forwarded",
+                "signals_forwarded_total": metrics.signals_forwarded,
+                "last_forward_ts": metrics.last_forward_ts,
+                "message": format!("Kha has forwarded {} signal(s) to Bridge", metrics.signals_forwarded),
+            })).await?;
         }
 
         let status = DaemonMessage::StatusUpdate {
@@ -391,8 +473,8 @@ impl KhaWatchd {
         // the moment of a poll tick — since polls run every 10s, that
         // condition could be missed entirely depending on drift, or never
         // fire if uptime reporting has any jitter.
-        debug!("[kha-watchd] Poll: Kha uptime={}s, threads={}, state={}, zombies={}",
-            current_uptime, num_threads, state.as_str(), zombie_count);
+        debug!("[kha-watchd] Poll: Kha uptime={}s, threads={}, state={}, zombies={}, reaped_total={}, signals_forwarded={}",
+            current_uptime, num_threads, state.as_str(), zombie_count, metrics.zombies_reaped, metrics.signals_forwarded);
 
         Ok(())
     }
@@ -423,6 +505,11 @@ async fn main() -> Result<()> {
     }).await;
 
     info!("[kha-watchd] Registration complete, entering monitoring loop");
+
+    // Connect to Kha's metrics socket
+    if let Err(e) = kha_watchd.connect_kha_metrics().await {
+        warn!("[kha-watchd] Failed to connect to Kha metrics socket: {} (Kha may not be running yet)", e);
+    }
 
     let mut poll_interval = interval(Duration::from_millis(POLL_INTERVAL_MS));
     let mut heartbeat_log_interval = interval(Duration::from_millis(HEARTBEAT_LOG_INTERVAL_MS));
